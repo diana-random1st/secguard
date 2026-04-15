@@ -1,0 +1,17 @@
+[package]
+name = "secguard-guard"
+description = "Destructive command detection for secguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+ml = ["secguard-brain"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+secguard-brain = { path = "../secguard-brain", optional = true }
