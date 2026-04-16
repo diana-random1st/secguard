@@ -207,6 +207,52 @@ fn hook_guard_destructive_gemini_shell() {
 }
 
 #[test]
+fn hook_guard_safe_codex_returns_empty_json() {
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "ls -la" }
+    });
+    secguard()
+        .args(["hook", "guard", "--target", "codex"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("{}\n"));
+}
+
+#[test]
+fn hook_guard_destructive_codex_returns_deny_json() {
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard", "--target", "codex"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"permissionDecision\":\"deny\""))
+        .stdout(predicate::str::contains("\"systemMessage\""));
+}
+
+#[test]
+fn hook_guard_unknown_codex_shape_returns_empty_json() {
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {}
+    });
+    secguard()
+        .args(["hook", "guard", "--target", "codex"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("{}\n"));
+}
+
+#[test]
 fn hook_guard_ignores_non_bash() {
     let input = serde_json::json!({
         "tool_name": "Read",
@@ -248,6 +294,21 @@ fn hook_secrets_redacts_key() {
         .success()
         .stdout(predicate::str::contains("REDACTED"))
         .stdout(predicate::str::contains("aws_access_key"));
+}
+
+#[test]
+fn hook_secrets_clean_input_for_codex_returns_empty_json() {
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "echo hello" }
+    });
+    secguard()
+        .args(["hook", "secrets-scan", "--target", "codex"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("{}\n"));
 }
 
 #[test]
@@ -339,7 +400,7 @@ fn init_creates_codex_hooks() {
     assert!(content.contains("PreToolUse"));
     assert!(content.contains("Bash"));
     assert!(content.contains("secguard hook guard"));
-    assert!(content.contains("secguard hook secrets-scan"));
+    assert!(!content.contains("secguard hook secrets-scan"));
 }
 
 #[test]

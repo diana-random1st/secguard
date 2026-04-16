@@ -128,10 +128,6 @@ fn install_codex(global: bool) -> anyhow::Result<()> {
         "type": "command",
         "command": format!("{bin} hook guard --target codex")
     });
-    let secrets_hook = serde_json::json!({
-        "type": "command",
-        "command": format!("{bin} hook secrets-scan --target codex")
-    });
 
     let mut hooks = load_json_object(&hooks_path)?;
     let pre = ensure_json_array(&mut hooks, &["hooks", "PreToolUse"])?;
@@ -145,10 +141,6 @@ fn install_codex(global: bool) -> anyhow::Result<()> {
         "matcher": "Bash",
         "hooks": [guard_hook]
     }));
-    pre.push(serde_json::json!({
-        "matcher": "Bash|Edit|Write|Agent|mcp__*",
-        "hooks": [secrets_hook]
-    }));
 
     if let Some(parent) = hooks_path.parent() {
         fs::create_dir_all(parent)?;
@@ -158,7 +150,7 @@ fn install_codex(global: bool) -> anyhow::Result<()> {
     eprintln!("Installed secguard hooks to {}", hooks_path.display());
     eprintln!("  - client: Codex");
     eprintln!("  - guard: Bash commands checked for destructive ops");
-    eprintln!("  - secrets-scan: credentials redacted from tool input");
+    eprintln!("  - secrets-scan: not installed for Codex (PreToolUse does not support input rewriting)");
 
     Ok(())
 }
