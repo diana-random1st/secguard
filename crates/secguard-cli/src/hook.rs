@@ -1,4 +1,4 @@
-//! Claude Code PreToolUse hook protocol handler.
+//! Hook protocol handler for Claude Code and Gemini CLI.
 
 use std::io::Read;
 
@@ -33,7 +33,7 @@ fn run_secrets_scan(v: &serde_json::Value) -> anyhow::Result<()> {
 
     if !findings.is_empty() {
         let types: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
-        let unique_types: std::collections::HashSet<&str> = types.into_iter().collect();
+        let unique_types: std::collections::BTreeSet<&str> = types.into_iter().collect();
         let context = format!(
             "[secguard] Redacted {} credential(s). Types: {}",
             findings.len(),
@@ -41,10 +41,14 @@ fn run_secrets_scan(v: &serde_json::Value) -> anyhow::Result<()> {
         );
         eprintln!("{context}");
 
+        let hook_event_name = incoming_hook_event_name(v);
         let json = serde_json::json!({
+            "decision": "allow",
+            "reason": context,
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
+                "hookEventName": hook_event_name,
                 "permissionDecision": "allow",
+                "permissionDecisionReason": context,
                 "updatedInput": input_clone,
                 "additionalContext": context
             }
@@ -57,22 +61,8 @@ fn run_secrets_scan(v: &serde_json::Value) -> anyhow::Result<()> {
 
 fn run_guard(v: &serde_json::Value) -> anyhow::Result<()> {
     let tool_name = v.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-
-    let text_to_check = match tool_name {
-        "Bash" => v
-            .get("tool_input")
-            .and_then(|v| v.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        name if name.starts_with("mcp__") => {
-            let tool_input = v
-                .get("tool_input")
-                .map(|v| serde_json::to_string(v).unwrap_or_default())
-                .unwrap_or_default();
-            format!("{name} {tool_input}")
-        }
-        _ => return Ok(()),
+    let Some(text_to_check) = text_to_check(tool_name, v) else {
+        return Ok(());
     };
 
     if text_to_check.is_empty() {
@@ -85,15 +75,18 @@ fn run_guard(v: &serde_json::Value) -> anyhow::Result<()> {
         let display = if text_to_check.len() > 200 {
             format!("{}...", &text_to_check[..197])
         } else {
-            text_to_check
+            text_to_check.clone()
         };
 
         let reason_text = format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
         eprintln!("[secguard] {reason_text}");
 
+        let hook_event_name = incoming_hook_event_name(v);
         let json = serde_json::json!({
+            "decision": "ask",
+            "reason": reason_text,
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
+                "hookEventName": hook_event_name,
                 "permissionDecision": "ask",
                 "permissionDecisionReason": reason_text
             }
@@ -102,4 +95,36 @@ fn run_guard(v: &serde_json::Value) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn incoming_hook_event_name(v: &serde_json::Value) -> String {
+    v.get("hook_event_name")
+        .or_else(|| v.get("hookEventName"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("PreToolUse")
+        .to_string()
+}
+
+fn text_to_check(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "Bash" => extract_command(value),
+        "run_shell_command" | "shell" => extract_command(value),
+        name if name.starts_with("mcp__") => {
+            let tool_input = value
+                .get("tool_input")
+                .map(|value| serde_json::to_string(value).unwrap_or_default())
+                .unwrap_or_default();
+            Some(format!("{name} {tool_input}"))
+        }
+        other if other.to_ascii_lowercase().contains("shell") => extract_command(value),
+        _ => None,
+    }
+}
+
+fn extract_command(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("tool_input")
+        .and_then(|value| value.get("command").or_else(|| value.get("cmd")))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }

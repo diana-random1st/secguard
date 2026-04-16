@@ -191,6 +191,22 @@ fn hook_guard_destructive_bash() {
 }
 
 #[test]
+fn hook_guard_destructive_gemini_shell() {
+    let input = serde_json::json!({
+        "hook_event_name": "BeforeTool",
+        "tool_name": "run_shell_command",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BeforeTool"))
+        .stdout(predicate::str::contains("ask"));
+}
+
+#[test]
 fn hook_guard_ignores_non_bash() {
     let input = serde_json::json!({
         "tool_name": "Read",
@@ -234,10 +250,30 @@ fn hook_secrets_redacts_key() {
         .stdout(predicate::str::contains("aws_access_key"));
 }
 
+#[test]
+fn hook_secrets_redacts_key_for_gemini() {
+    let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+    let input = serde_json::json!({
+        "hook_event_name": "BeforeTool",
+        "tool_name": "write_file",
+        "tool_input": {
+            "path": "tmp.txt",
+            "content": format!("token={key}")
+        }
+    });
+    secguard()
+        .args(["hook", "secrets-scan"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BeforeTool"))
+        .stdout(predicate::str::contains("REDACTED"));
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn init_creates_settings() {
+fn init_creates_claude_settings() {
     let dir = tempfile::tempdir().unwrap();
     let settings_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&settings_dir).unwrap();
@@ -256,6 +292,81 @@ fn init_creates_settings() {
     let content = std::fs::read_to_string(&settings_path).unwrap();
     assert!(content.contains("secguard hook guard"));
     assert!(content.contains("secguard hook secrets-scan"));
+}
+
+#[test]
+fn init_creates_gemini_settings() {
+    let dir = tempfile::tempdir().unwrap();
+
+    secguard()
+        .args(["init", "gemini"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Gemini CLI"));
+
+    let settings_path = dir.path().join(".gemini").join("settings.json");
+    assert!(settings_path.exists());
+
+    let content = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(content.contains("BeforeTool"));
+    assert!(content.contains("run_shell_command"));
+    assert!(content.contains("secguard hook secrets-scan"));
+}
+
+#[test]
+fn init_creates_codex_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "[features]\ncodex_hooks = true\n",
+    )
+    .unwrap();
+
+    secguard()
+        .args(["init", "codex"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Codex"));
+
+    let hooks_path = codex_dir.join("hooks.json");
+    assert!(hooks_path.exists());
+
+    let content = std::fs::read_to_string(&hooks_path).unwrap();
+    assert!(content.contains("PreToolUse"));
+    assert!(content.contains("Bash"));
+    assert!(content.contains("secguard hook guard"));
+    assert!(content.contains("secguard hook secrets-scan"));
+}
+
+#[test]
+fn init_codex_warns_without_feature_flag_but_still_installs() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex_dir = dir.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "[features]\ncodex_hooks = false\n",
+    )
+    .unwrap();
+
+    secguard()
+        .args(["init", "codex"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Warning: Codex hooks support is not confirmed",
+        ));
+
+    let hooks_path = codex_dir.join("hooks.json");
+    assert!(hooks_path.exists());
+
+    let content = std::fs::read_to_string(&hooks_path).unwrap();
+    assert!(content.contains("secguard"));
 }
 
 #[test]

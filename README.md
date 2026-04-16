@@ -2,7 +2,7 @@
 
 3-level security guard for AI coding agents. Catches leaked credentials and blocks destructive shell commands before they execute.
 
-Built for [Claude Code](https://claude.ai/code) hooks, works anywhere: CI pipelines, git pre-commit, standalone CLI.
+Built for [Claude Code](https://claude.ai/code), Gemini CLI, and Codex workflows. Also works anywhere: CI pipelines, git pre-commit, standalone CLI.
 
 ## What it does
 
@@ -31,9 +31,13 @@ Two guards, three levels of detection each.
 
 ## How to use it
 
-Four modes, same binary.
+Five modes, same binary.
 
 **Claude Code hook** (`secguard init --global`). Registers as a PreToolUse hook. Guard checks every Bash command before execution; secrets-scan redacts credentials from Bash/Edit/Write/Agent/MCP tool input. Blocked commands get `permissionDecision: "ask"` so the user sees the warning and decides.
+
+**Gemini CLI hook** (`secguard init gemini --global`). Registers `BeforeTool` hooks in `~/.gemini/settings.json`. Guard checks `run_shell_command` before execution; secrets-scan redacts credentials from all tool input using the same hook runtime.
+
+**Codex hook** (`secguard init codex --global`). Registers `PreToolUse` hooks in `~/.codex/hooks.json`. `secguard` also checks whether `~/.codex/config.toml` enables hooks via `[features] codex_hooks = true`; if not, it prints a warning but still writes the hook definitions.
 
 **Standalone CLI.** Pipe a command into `secguard guard`, pipe text into `secguard scan`. Exit code 0 = safe, 1 = problem found. Works in scripts, Makefiles, anywhere.
 
@@ -84,6 +88,37 @@ Writes two PreToolUse hooks to `~/.claude/settings.json`:
 If the ML model isn't installed, `init` will offer to download it.
 
 Project-level install (without `--global`) writes to `.claude/settings.json` in the current directory.
+
+## Setup for Gemini CLI
+
+```bash
+secguard init gemini --global
+```
+
+Writes two `BeforeTool` hooks to `~/.gemini/settings.json`:
+- **guard** on `run_shell_command` — checks commands before execution
+- **secrets-scan** on `.*` — redacts credentials from tool input
+
+Project-level install (without `--global`) writes to `.gemini/settings.json` in the current directory.
+
+The hook runtime understands both Claude Code `PreToolUse` payloads and Gemini `BeforeTool` payloads.
+
+## Setup for Codex
+
+```bash
+secguard init codex --global
+```
+
+Checks `~/.codex/config.toml` for:
+- **hooks support** — expects `[features] codex_hooks = true`
+
+Then writes two `PreToolUse` hooks to `~/.codex/hooks.json`:
+- **guard** on Bash — checks commands before execution
+- **secrets-scan** on Bash/Edit/Write/Agent/MCP — redacts credentials from tool input
+
+If hook support is not enabled in `config.toml`, `secguard` prints a warning but still writes the hook file.
+
+Project-level install (without `--global`) writes to `.codex/hooks.json` in the current directory and checks `.codex/config.toml` in the same directory.
 
 ## ML model (optional)
 
