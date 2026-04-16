@@ -24,11 +24,11 @@ fn install_claude(global: bool) -> anyhow::Result<()> {
 
     let guard_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook guard")
+        "command": format!("{bin} hook guard --target claude")
     });
     let secrets_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook secrets-scan")
+        "command": format!("{bin} hook secrets-scan --target claude")
     });
 
     let mut settings = load_json_object(&settings_path)?;
@@ -66,11 +66,11 @@ fn install_gemini(global: bool) -> anyhow::Result<()> {
 
     let guard_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook guard")
+        "command": format!("{bin} hook guard --target gemini")
     });
     let secrets_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook secrets-scan")
+        "command": format!("{bin} hook secrets-scan --target gemini")
     });
 
     let mut settings = load_json_object(&settings_path)?;
@@ -126,11 +126,11 @@ fn install_codex(global: bool) -> anyhow::Result<()> {
 
     let guard_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook guard")
+        "command": format!("{bin} hook guard --target codex")
     });
     let secrets_hook = serde_json::json!({
         "type": "command",
-        "command": format!("{bin} hook secrets-scan")
+        "command": format!("{bin} hook secrets-scan --target codex")
     });
 
     let mut hooks = load_json_object(&hooks_path)?;

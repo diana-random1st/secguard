@@ -1,4 +1,4 @@
-//! Hook protocol handler for Claude Code and Gemini CLI.
+//! Hook protocol handler for Claude Code, Gemini CLI, and Codex CLI.
 
 use std::io::Read;
 
@@ -10,19 +10,29 @@ pub enum HookMode {
     Guard,
 }
 
-pub fn run(mode: HookMode) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum HookTarget {
+    /// Claude Code (uses "ask" + hookSpecificOutput)
+    Claude,
+    /// Codex CLI (uses "deny" + systemMessage; "ask" fails open)
+    Codex,
+    /// Gemini CLI (BeforeTool events)
+    Gemini,
+}
+
+pub fn run(mode: HookMode, target: HookTarget) -> anyhow::Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
     let v: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::json!({}));
 
     match mode {
-        HookMode::SecretsScan => run_secrets_scan(&v),
-        HookMode::Guard => run_guard(&v),
+        HookMode::SecretsScan => run_secrets_scan(&v, target),
+        HookMode::Guard => run_guard(&v, target),
     }
 }
 
-fn run_secrets_scan(v: &serde_json::Value) -> anyhow::Result<()> {
+fn run_secrets_scan(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
     let scanner = secguard_secrets::Scanner::new();
     let mut input_clone = v
         .get("tool_input")
@@ -42,24 +52,38 @@ fn run_secrets_scan(v: &serde_json::Value) -> anyhow::Result<()> {
         eprintln!("{context}");
 
         let hook_event_name = incoming_hook_event_name(v);
-        let json = serde_json::json!({
-            "decision": "allow",
-            "reason": context,
-            "hookSpecificOutput": {
-                "hookEventName": hook_event_name,
-                "permissionDecision": "allow",
-                "permissionDecisionReason": context,
-                "updatedInput": input_clone,
-                "additionalContext": context
-            }
-        });
+        let json = match target {
+            HookTarget::Codex => serde_json::json!({
+                "decision": "allow",
+                "reason": &context,
+                "systemMessage": &context,
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": &context,
+                    "updatedInput": input_clone,
+                    "additionalContext": &context
+                }
+            }),
+            _ => serde_json::json!({
+                "decision": "allow",
+                "reason": &context,
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": &context,
+                    "updatedInput": input_clone,
+                    "additionalContext": &context
+                }
+            }),
+        };
         println!("{}", serde_json::to_string(&json)?);
     }
 
     Ok(())
 }
 
-fn run_guard(v: &serde_json::Value) -> anyhow::Result<()> {
+fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
     let tool_name = v.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let Some(text_to_check) = text_to_check(tool_name, v) else {
         return Ok(());
@@ -82,15 +106,27 @@ fn run_guard(v: &serde_json::Value) -> anyhow::Result<()> {
         eprintln!("[secguard] {reason_text}");
 
         let hook_event_name = incoming_hook_event_name(v);
-        let json = serde_json::json!({
-            "decision": "ask",
-            "reason": reason_text,
-            "hookSpecificOutput": {
-                "hookEventName": hook_event_name,
-                "permissionDecision": "ask",
-                "permissionDecisionReason": reason_text
-            }
-        });
+        let json = match target {
+            HookTarget::Codex => serde_json::json!({
+                "decision": "deny",
+                "reason": &reason_text,
+                "systemMessage": &reason_text,
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": &reason_text
+                }
+            }),
+            _ => serde_json::json!({
+                "decision": "ask",
+                "reason": &reason_text,
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": &reason_text
+                }
+            }),
+        };
         println!("{}", serde_json::to_string(&json)?);
     }
 
