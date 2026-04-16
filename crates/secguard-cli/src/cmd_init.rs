@@ -150,7 +150,9 @@ fn install_codex(global: bool) -> anyhow::Result<()> {
     eprintln!("Installed secguard hooks to {}", hooks_path.display());
     eprintln!("  - client: Codex");
     eprintln!("  - guard: Bash commands checked for destructive ops");
-    eprintln!("  - secrets-scan: not installed for Codex (PreToolUse does not support input rewriting)");
+    eprintln!(
+        "  - secrets-scan: not installed for Codex (PreToolUse does not support input rewriting)"
+    );
 
     Ok(())
 }

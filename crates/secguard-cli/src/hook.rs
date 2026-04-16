@@ -146,11 +146,7 @@ fn allow_response(
     }
 }
 
-fn deny_response(
-    target: HookTarget,
-    hook_event_name: String,
-    reason: String,
-) -> serde_json::Value {
+fn deny_response(target: HookTarget, hook_event_name: String, reason: String) -> serde_json::Value {
     let permission_decision = match target {
         HookTarget::Codex => "deny",
         _ => "ask",
