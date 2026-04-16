@@ -292,12 +292,19 @@ fn codex_hooks_enabled(config: &str) -> Option<bool> {
 }
 
 fn maybe_offer_model_download() -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
     let model_path = dirs::home_dir()
         .unwrap_or_default()
         .join(".secguard")
         .join("models")
         .join("secguard-guard.gguf");
     if !model_path.exists() {
+        if !std::io::stdin().is_terminal() {
+            eprintln!();
+            eprintln!("ML model not found. Run `secguard model` to download secguard-guard.gguf (~774MB).");
+            return Ok(());
+        }
         eprintln!();
         eprintln!("ML model not found. Download secguard-guard.gguf (~774MB)?");
         eprintln!("This enables L3 (ML) destructive command detection.");
