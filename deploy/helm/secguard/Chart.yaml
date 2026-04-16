@@ -1,0 +1,6 @@
+apiVersion: v2
+name: secguard
+description: Security guard HTTP service for AI agent hooks
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

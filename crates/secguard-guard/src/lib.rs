@@ -9,7 +9,7 @@ pub mod policy;
 #[cfg(feature = "ml")]
 mod brain;
 
-use config::GuardConfig;
+pub use config::GuardConfig;
 
 /// Result of guard classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
