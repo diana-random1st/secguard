@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secguard.fullname" . }}
+  labels:
+    {{- include "secguard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "secguard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "secguard.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "secguard.serviceAccountName" . }}
+      containers:
+        - name: secguard
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--port"
+            - "{{ .Values.service.port }}"
+            - "--target"
+            - "{{ .Values.target }}"
+            {{- if .Values.guardConfig }}
+            - "--config"
+            - "/etc/secguard/guard-config.json"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: info
+            {{- if or .Values.auth.token .Values.auth.existingSecret }}
+            - name: SECGUARD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "secguard.secretName" . }}
+                  key: token
+            {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.guardConfig }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/secguard
+              readOnly: true
+          {{- end }}
+      {{- if .Values.guardConfig }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "secguard.fullname" . }}-config
+      {{- end }}

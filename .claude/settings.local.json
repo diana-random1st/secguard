@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__diana-gw-diana-daemon__ui_bubble_show"
+    ]
+  }
+}

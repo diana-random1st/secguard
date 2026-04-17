@@ -1,0 +1,10 @@
+{{- if .Values.guardConfig }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secguard.fullname" . }}-config
+  labels:
+    {{- include "secguard.labels" . | nindent 4 }}
+data:
+  guard-config.json: {{ .Values.guardConfig | toJson | quote }}
+{{- end }}

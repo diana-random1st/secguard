@@ -186,10 +186,10 @@ fn check_saas_cli_destructive(cmd: &str) -> Option<String> {
     }
 
     for cli in SAAS_CLIS {
-        if !cmd.contains(cli) {
+        if *cli == "gh " || *cli == "hub " {
             continue;
         }
-        if *cli == "gh " || *cli == "hub " {
+        if !is_command_position(cmd, cli) {
             continue;
         }
         for sub in DESTRUCTIVE_SUBS {
@@ -204,6 +204,23 @@ fn check_saas_cli_destructive(cmd: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Check if `needle` appears at a command position in `cmd` —
+/// either at the start or immediately after a shell separator (`&&`, `||`, `;`, `|`).
+fn is_command_position(cmd: &str, needle: &str) -> bool {
+    if cmd.starts_with(needle) {
+        return true;
+    }
+    for sep in &["&& ", "|| ", "; ", "| "] {
+        for part in cmd.split(sep) {
+            let trimmed = part.trim();
+            if trimmed.starts_with(needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -1,0 +1,49 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/diana-random1st/secguard-server
+  tag: ""
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Hook output format: claude, codex, or gemini
+target: claude
+
+auth:
+  # Bearer token for /hook/* endpoints. If empty, auth is disabled.
+  token: ""
+  # Use an existing k8s Secret instead of creating one.
+  # Secret must have key "token".
+  existingSecret: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Optional GuardConfig JSON override
+guardConfig: {}
