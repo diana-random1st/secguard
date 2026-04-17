@@ -370,9 +370,8 @@ impl MicroBrain {
         }
 
         let mut output = String::new();
-        let mut n_cur = tokens.len();
 
-        for _ in 0..self.max_tokens {
+        for n_cur in tokens.len()..tokens.len() + self.max_tokens {
             let mut candidates = ctx.token_data_array_ith(batch.n_tokens() - 1);
             let new_token = candidates.sample_token_greedy();
             if self.model.is_eog_token(new_token) {
@@ -397,7 +396,6 @@ impl MicroBrain {
             if ctx.decode(&mut batch).is_err() {
                 break;
             }
-            n_cur += 1;
         }
 
         if output.trim().is_empty() {
