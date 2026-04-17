@@ -33,11 +33,14 @@ enum Commands {
         /// Command to check (reads from stdin if not provided)
         command: Option<String>,
     },
-    /// Claude Code hook mode (reads PreToolUse JSON from stdin)
+    /// Claude Code / Gemini CLI / Codex hook mode (reads hook JSON from stdin)
     Hook {
         /// Hook type
         #[arg(value_enum)]
         mode: hook::HookMode,
+        /// Target client (affects output format)
+        #[arg(long, value_enum, default_value_t = hook::HookTarget::Claude)]
+        target: hook::HookTarget,
     },
     /// Download ML models from GitHub Releases
     Model {
@@ -45,9 +48,12 @@ enum Commands {
         #[arg(long)]
         dir: Option<String>,
     },
-    /// Install secguard as Claude Code hooks
+    /// Install secguard into Claude Code, Gemini CLI, or Codex config
     Init {
-        /// Install to global ~/.claude/settings.json (default: project .claude/settings.json)
+        /// Target client
+        #[arg(value_enum, default_value_t = cmd_init::InitTarget::Claude)]
+        target: cmd_init::InitTarget,
+        /// Install to the user's global client config instead of the project-local config
         #[arg(long)]
         global: bool,
     },
@@ -60,8 +66,8 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Scan { dir, format } => cmd_scan::run(dir, &format),
         Commands::Guard { command } => cmd_guard::run(command),
-        Commands::Hook { mode } => hook::run(mode),
+        Commands::Hook { mode, target } => hook::run(mode, target),
         Commands::Model { dir } => cmd_model::run(dir),
-        Commands::Init { global } => cmd_init::run(global),
+        Commands::Init { target, global } => cmd_init::run(target, global),
     }
 }
