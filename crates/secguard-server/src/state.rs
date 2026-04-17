@@ -13,7 +13,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(target: HookTarget, guard_config: secguard_guard::GuardConfig) -> Arc<Self> {
-        let auth_token = std::env::var("SECGUARD_TOKEN").ok().filter(|t| !t.is_empty());
+        let auth_token = std::env::var("SECGUARD_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
         if auth_token.is_some() {
             log::info!("bearer token auth enabled for /hook/* endpoints");
         } else {

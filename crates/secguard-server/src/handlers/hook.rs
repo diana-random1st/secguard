@@ -11,10 +11,7 @@ pub async fn guard(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tool_name = body
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let tool_name = body.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
     let Some(text) = response::text_to_check(tool_name, &body) else {
         state
@@ -58,8 +55,7 @@ pub async fn guard(
             } else {
                 text
             };
-            let reason_text =
-                format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
+            let reason_text = format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
             let hook_event_name = response::incoming_hook_event_name(&body);
             let json = response::guard_block(state.target, &hook_event_name, &reason_text);
             (StatusCode::OK, Json(json))
@@ -129,7 +125,6 @@ pub async fn secrets_scan(
     );
 
     let hook_event_name = response::incoming_hook_event_name(&body);
-    let json =
-        response::secrets_redacted(state.target, &hook_event_name, &context, input_clone);
+    let json = response::secrets_redacted(state.target, &hook_event_name, &context, input_clone);
     (StatusCode::OK, Json(json))
 }
