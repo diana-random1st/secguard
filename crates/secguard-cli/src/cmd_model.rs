@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const HF_REPO: &str = "random1st/secguard-models";
-const MODELS: &[(&str, u64)] = &[("secguard-guard.gguf", 811_614_688)];
+const MODELS: &[(&str, u64)] = &[("secguard-guard.gguf", 639_447_168)];
 
 fn models_dir() -> PathBuf {
     dirs::home_dir()
