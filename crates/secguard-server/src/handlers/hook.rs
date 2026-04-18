@@ -36,11 +36,13 @@ pub async fn guard(
     }
 
     let start = std::time::Instant::now();
-    let verdict = secguard_guard::check_with_config(&text, &state.guard_config);
+    let detail = secguard_guard::check_detailed(&text, &state.guard_config);
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.guard_duration.observe(elapsed);
 
-    match verdict {
+    let source = serde_json::to_string(&detail.source).unwrap_or_default();
+
+    match &detail.verdict {
         secguard_guard::Verdict::Destructive(reason) => {
             state
                 .metrics
@@ -49,6 +51,14 @@ pub async fn guard(
                     verdict: "destructive".into(),
                 })
                 .inc();
+
+            log::info!(
+                "{{\"mode\":\"guard\",\"verdict\":\"destructive\",\"source\":{},\"command\":{},\"reason\":{},\"latency_ms\":{:.3}}}",
+                source,
+                serde_json::to_string(&text.chars().take(200).collect::<String>()).unwrap_or_default(),
+                serde_json::to_string(reason).unwrap_or_default(),
+                elapsed * 1000.0,
+            );
 
             let display = if text.len() > 200 {
                 format!("{}...", &text[..197])
@@ -68,6 +78,13 @@ pub async fn guard(
                     verdict: "safe".into(),
                 })
                 .inc();
+
+            log::debug!(
+                "{{\"mode\":\"guard\",\"verdict\":\"safe\",\"source\":{},\"latency_ms\":{:.3}}}",
+                source,
+                elapsed * 1000.0,
+            );
+
             (StatusCode::OK, Json(serde_json::json!({})))
         }
     }
@@ -106,6 +123,7 @@ pub async fn secrets_scan(
         })
         .inc();
 
+    let rule_ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
     for finding in &findings {
         state
             .metrics
@@ -115,6 +133,13 @@ pub async fn secrets_scan(
             })
             .inc();
     }
+
+    log::info!(
+        "{{\"mode\":\"secrets-scan\",\"findings\":{},\"rule_ids\":{},\"latency_ms\":{:.3}}}",
+        findings.len(),
+        serde_json::to_string(&rule_ids).unwrap_or_default(),
+        elapsed * 1000.0,
+    );
 
     let types: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
     let unique_types: std::collections::BTreeSet<&str> = types.into_iter().collect();
