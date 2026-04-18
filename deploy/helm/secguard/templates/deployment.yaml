@@ -15,6 +15,10 @@ spec:
         {{- include "secguard.selectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "secguard.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: secguard
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
