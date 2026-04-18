@@ -2,6 +2,8 @@
 
 use std::io::Read;
 
+use crate::telemetry;
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum HookMode {
     /// Scan tool input for secrets and redact them
@@ -18,6 +20,16 @@ pub enum HookTarget {
     Codex,
     /// Gemini CLI (BeforeTool events)
     Gemini,
+}
+
+impl std::fmt::Display for HookTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HookTarget::Claude => write!(f, "claude"),
+            HookTarget::Codex => write!(f, "codex"),
+            HookTarget::Gemini => write!(f, "gemini"),
+        }
+    }
 }
 
 pub fn run(mode: HookMode, target: HookTarget) -> anyhow::Result<()> {
@@ -39,7 +51,19 @@ fn run_secrets_scan(v: &serde_json::Value, target: HookTarget) -> anyhow::Result
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
+    let start = std::time::Instant::now();
     let findings = secguard_secrets::redact_value(&mut input_clone, &scanner);
+    let latency_us = start.elapsed().as_micros();
+
+    let rule_ids: Vec<String> = findings.iter().map(|f| f.rule_id.clone()).collect();
+    telemetry::emit_secrets(&telemetry::SecretsEvent {
+        ts: telemetry::now_iso(),
+        mode: "secrets-scan",
+        findings_count: findings.len(),
+        rule_ids,
+        latency_us,
+        target: target.to_string(),
+    });
 
     if !findings.is_empty() {
         let types: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
@@ -79,9 +103,37 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let verdict = secguard_guard::check(&text_to_check);
+    let start = std::time::Instant::now();
+    let detail =
+        secguard_guard::check_detailed(&text_to_check, &secguard_guard::GuardConfig::default());
+    let latency_us = start.elapsed().as_micros();
 
-    if let secguard_guard::Verdict::Destructive(reason) = verdict {
+    let (verdict_str, reason) = match &detail.verdict {
+        secguard_guard::Verdict::Safe => ("safe", None),
+        secguard_guard::Verdict::Destructive(r) => ("destructive", Some(r.clone())),
+    };
+
+    telemetry::emit_guard(&telemetry::GuardEvent {
+        ts: telemetry::now_iso(),
+        mode: "guard",
+        tool_name: tool_name.to_string(),
+        command: if text_to_check.len() > 500 {
+            format!("{}...", &text_to_check[..497])
+        } else {
+            text_to_check.clone()
+        },
+        verdict: verdict_str,
+        verdict_source: serde_json::to_string(&detail.source)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        reason: reason.clone(),
+        confidence: detail.confidence,
+        latency_us,
+        target: target.to_string(),
+    });
+
+    if let secguard_guard::Verdict::Destructive(reason) = detail.verdict {
         let display = if text_to_check.len() > 200 {
             format!("{}...", &text_to_check[..197])
         } else {

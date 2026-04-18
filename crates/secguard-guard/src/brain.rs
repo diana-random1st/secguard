@@ -27,12 +27,16 @@ fn get_guard_brain() -> &'static Option<MicroBrain> {
 }
 
 pub fn check_destructive(cmd: &str) -> Option<String> {
+    check_destructive_detailed(cmd).map(|(reason, _)| reason)
+}
+
+pub fn check_destructive_detailed(cmd: &str) -> Option<(String, f32)> {
     let brain = get_guard_brain().as_ref()?;
     let (label, confidence) = brain.classify_with_confidence(cmd)?;
     if label == "destructive" && confidence >= CONFIDENCE_THRESHOLD {
-        Some(format!(
-            "brain: destructive ({:.0}% confidence)",
-            confidence * 100.0,
+        Some((
+            format!("brain: destructive ({:.0}% confidence)", confidence * 100.0),
+            confidence,
         ))
     } else {
         log::debug!(
