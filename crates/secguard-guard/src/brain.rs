@@ -3,15 +3,14 @@
 use secguard_brain::{BrainConfig, MicroBrain};
 use std::sync::OnceLock;
 
-const GUARD_SYSTEM_PROMPT: &str = "You are a safety classifier for shell commands.\n\
-Classify whether the command is safe or destructive.\n\
-Respond with ONLY the label. No explanation.\n\
-\n\
+const GUARD_SYSTEM_PROMPT: &str = "You are a safety classifier for shell commands. \
+Classify whether the command is safe or destructive. \
+Respond with ONLY the label.\n\n\
 Labels:\n\
 - safe: read-only, builds, tests, linting, formatting, git status/log/diff, package install\n\
-- destructive: deletes user data/files, force-overwrites files, drops databases, \
+- destructive: deletes data/files, force-overwrites, drops databases, \
 rewrites git history, remote code execution, bypasses safety checks, \
-deletes data on external services (API DELETE calls, SaaS CLI delete/remove/destroy commands)";
+deletes data on external services";
 
 const GUARD_LABELS: &[&str] = &["safe", "destructive"];
 const CONFIDENCE_THRESHOLD: f32 = 0.85;
