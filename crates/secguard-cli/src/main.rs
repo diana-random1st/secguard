@@ -5,6 +5,7 @@ mod cmd_init;
 pub(crate) mod cmd_model;
 mod cmd_scan;
 mod hook;
+mod telemetry;
 
 #[derive(Parser)]
 #[command(

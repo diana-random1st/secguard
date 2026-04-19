@@ -20,25 +20,65 @@ pub enum Verdict {
     Destructive(String),
 }
 
+/// Which phase produced the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictSource {
+    Policy,
+    Heuristic,
+    Brain,
+    Default,
+}
+
+/// Verdict with source information for telemetry.
+#[derive(Debug, Clone)]
+pub struct VerdictDetail {
+    pub verdict: Verdict,
+    pub source: VerdictSource,
+    /// ML confidence score (0.0–1.0), only set when source is Brain.
+    pub confidence: Option<f32>,
+}
+
 /// Classify a shell command through all enabled phases.
 pub fn check(cmd: &str) -> Verdict {
-    check_with_config(cmd, &GuardConfig::default())
+    check_detailed(cmd, &GuardConfig::default()).verdict
 }
 
 /// Classify with custom configuration.
 pub fn check_with_config(cmd: &str, config: &GuardConfig) -> Verdict {
+    check_detailed(cmd, config).verdict
+}
+
+/// Classify with full detail (verdict + source + confidence).
+pub fn check_detailed(cmd: &str, config: &GuardConfig) -> VerdictDetail {
     if policy::is_safe_by_policy(cmd) {
-        return Verdict::Safe;
+        return VerdictDetail {
+            verdict: Verdict::Safe,
+            source: VerdictSource::Policy,
+            confidence: None,
+        };
     }
 
     if let Some(reason) = heuristic::check_destructive(cmd, config) {
-        return Verdict::Destructive(reason);
+        return VerdictDetail {
+            verdict: Verdict::Destructive(reason),
+            source: VerdictSource::Heuristic,
+            confidence: None,
+        };
     }
 
     #[cfg(feature = "ml")]
-    if let Some(reason) = brain::check_destructive(cmd) {
-        return Verdict::Destructive(reason);
+    if let Some((reason, confidence)) = brain::check_destructive_detailed(cmd) {
+        return VerdictDetail {
+            verdict: Verdict::Destructive(reason),
+            source: VerdictSource::Brain,
+            confidence: Some(confidence),
+        };
     }
 
-    Verdict::Safe
+    VerdictDetail {
+        verdict: Verdict::Safe,
+        source: VerdictSource::Default,
+        confidence: None,
+    }
 }

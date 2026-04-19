@@ -3,15 +3,14 @@
 use secguard_brain::{BrainConfig, MicroBrain};
 use std::sync::OnceLock;
 
-const GUARD_SYSTEM_PROMPT: &str = "You are a safety classifier for shell commands.\n\
-Classify whether the command is safe or destructive.\n\
-Respond with ONLY the label. No explanation.\n\
-\n\
+const GUARD_SYSTEM_PROMPT: &str = "You are a safety classifier for shell commands. \
+Classify whether the command is safe or destructive. \
+Respond with ONLY the label.\n\n\
 Labels:\n\
 - safe: read-only, builds, tests, linting, formatting, git status/log/diff, package install\n\
-- destructive: deletes user data/files, force-overwrites files, drops databases, \
+- destructive: deletes data/files, force-overwrites, drops databases, \
 rewrites git history, remote code execution, bypasses safety checks, \
-deletes data on external services (API DELETE calls, SaaS CLI delete/remove/destroy commands)";
+deletes data on external services";
 
 const GUARD_LABELS: &[&str] = &["safe", "destructive"];
 const CONFIDENCE_THRESHOLD: f32 = 0.85;
@@ -27,12 +26,16 @@ fn get_guard_brain() -> &'static Option<MicroBrain> {
 }
 
 pub fn check_destructive(cmd: &str) -> Option<String> {
+    check_destructive_detailed(cmd).map(|(reason, _)| reason)
+}
+
+pub fn check_destructive_detailed(cmd: &str) -> Option<(String, f32)> {
     let brain = get_guard_brain().as_ref()?;
     let (label, confidence) = brain.classify_with_confidence(cmd)?;
     if label == "destructive" && confidence >= CONFIDENCE_THRESHOLD {
-        Some(format!(
-            "brain: destructive ({:.0}% confidence)",
-            confidence * 100.0,
+        Some((
+            format!("brain: destructive ({:.0}% confidence)", confidence * 100.0),
+            confidence,
         ))
     } else {
         log::debug!(
