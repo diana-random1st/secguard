@@ -64,11 +64,27 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Scan { dir, format } => cmd_scan::run(dir, &format),
         Commands::Guard { command } => cmd_guard::run(command),
         Commands::Hook { mode, target } => hook::run(mode, target),
         Commands::Model { dir } => cmd_model::run(dir),
         Commands::Init { target, global } => cmd_init::run(target, global),
-    }
+    };
+
+    // Flush stdout/stderr then use _exit to skip C++ global destructors that
+    // trigger a Metal backend cleanup abort in llama-cpp-2 when ml is enabled.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            let _ = std::io::stderr().flush();
+            1
+        }
+    };
+    unsafe { libc::_exit(code) }
 }

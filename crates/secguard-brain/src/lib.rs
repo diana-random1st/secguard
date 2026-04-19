@@ -168,10 +168,6 @@ impl MicroBrain {
         let user_label = self.model.str_to_token("user", AddBos::Never).ok()?;
         let user_text = self.model.str_to_token(input, AddBos::Never).ok()?;
         let assistant_label = self.model.str_to_token("assistant", AddBos::Never).ok()?;
-        let think_suffix = self
-            .model
-            .str_to_token("<think>\n\n</think>\n\n", AddBos::Never)
-            .ok()?;
 
         let mut tokens = Vec::new();
         tokens.push(im_start);
@@ -189,7 +185,6 @@ impl MicroBrain {
         tokens.push(im_start);
         tokens.extend_from_slice(&assistant_label);
         tokens.push(nl);
-        tokens.extend_from_slice(&think_suffix);
 
         let mut batch = LlamaBatch::new(tokens.len(), 1);
         for (i, &token) in tokens.iter().enumerate() {
@@ -334,10 +329,6 @@ impl MicroBrain {
         let user_label = self.model.str_to_token("user", AddBos::Never).ok()?;
         let user_text = self.model.str_to_token(input, AddBos::Never).ok()?;
         let assistant_label = self.model.str_to_token("assistant", AddBos::Never).ok()?;
-        let think_suffix = self
-            .model
-            .str_to_token("<think>\n\n</think>\n\n", AddBos::Never)
-            .ok()?;
 
         let mut tokens = Vec::new();
         tokens.push(im_start);
@@ -355,7 +346,6 @@ impl MicroBrain {
         tokens.push(im_start);
         tokens.extend_from_slice(&assistant_label);
         tokens.push(nl);
-        tokens.extend_from_slice(&think_suffix);
 
         let mut batch = LlamaBatch::new(tokens.len(), 1);
         for (i, &token) in tokens.iter().enumerate() {
