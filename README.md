@@ -27,17 +27,19 @@ Two guards, three levels of detection each.
 
 `rm -rf build`, `rm -rf node_modules`, `rm -rf target/debug` are safe by default. Configurable via `GuardConfig`.
 
-*Phase 2: ML brain.* Qwen3.5-2B-Q8 GGUF model classifies commands the heuristics don't cover. Catches things like `terraform destroy -auto-approve`, `redis-cli FLUSHALL`, `ansible-playbook teardown.yml`. 85% confidence threshold. Optional; falls back to heuristic-only when absent.
+*Phase 2: ML brain.* Qwen3.5-2B-F16 GGUF model (fine-tuned LoRA on 21K labeled commands) classifies commands the heuristics don't cover. 85% confidence threshold. Optional; falls back to heuristic-only when absent.
 
 ## How to use it
 
-Five modes, same binary.
+Seven modes, same codebase.
 
 **Claude Code hook** (`secguard init --global`). Registers as a PreToolUse hook. Guard checks every Bash command before execution; secrets-scan redacts credentials from Bash/Edit/Write/Agent/MCP tool input. Blocked commands get `permissionDecision: "ask"` so the user sees the warning and decides.
 
 **Gemini CLI hook** (`secguard init gemini --global`). Registers `BeforeTool` hooks in `~/.gemini/settings.json`. Guard checks `run_shell_command` before execution; secrets-scan redacts credentials from all tool input using the same hook runtime.
 
-**Codex hook** (`secguard init codex --global`). Registers `PreToolUse` hooks in `~/.codex/hooks.json`. `secguard` also checks whether `~/.codex/config.toml` enables hooks via `[features] codex_hooks = true`; if not, it prints a warning but still writes the hook definitions.
+**Codex hook** (`secguard init codex --global`). Registers `PreToolUse` hook in `~/.codex/hooks.json`. Uses `permissionDecision: "deny"` + `systemMessage` (Codex ignores `"ask"`). Secrets-scan is disabled for Codex because its PreToolUse contract doesn't support input rewriting.
+
+**HTTP server** (`secguard-server --port 8080`). Axum-based service exposing `POST /hook/guard` and `POST /hook/secrets-scan` with Claude Code HTTP hooks compatibility. Bearer token auth via `SECGUARD_TOKEN`. Prometheus metrics at `/metrics`. Health probes at `/healthz` and `/readyz`. Deploy as Docker image or Helm chart for team-wide protection.
 
 **Standalone CLI.** Pipe a command into `secguard guard`, pipe text into `secguard scan`. Exit code 0 = safe, 1 = problem found. Works in scripts, Makefiles, anywhere.
 
@@ -126,7 +128,47 @@ Project-level install (without `--global`) writes to `.codex/hooks.json` in the 
 secguard model
 ```
 
-Downloads `secguard-guard.gguf` (774MB, Qwen3.5-2B-Q8) from HuggingFace to `~/.secguard/models/`. The guard works fine without it; the model catches edge cases that heuristics don't cover.
+Downloads `secguard-guard.gguf` (3.8GB, Qwen3.5-2B fine-tuned, F16 GGUF) from [HuggingFace](https://huggingface.co/random1st/secguard-models) to `~/.secguard/models/`. The guard works fine without it; the model catches edge cases that heuristics don't cover.
+
+## HTTP server & k8s deployment
+
+```bash
+# Local
+docker run -p 8080:8080 -e SECGUARD_TOKEN=your-token \
+  ghcr.io/diana-random1st/secguard-server:latest
+
+# Kubernetes (Helm)
+helm install secguard ./deploy/helm/secguard \
+  --set auth.token=your-token \
+  --set target=claude
+```
+
+Then point Claude Code HTTP hooks to it:
+
+```json
+{
+  "type": "http",
+  "url": "http://secguard:8080/hook/guard",
+  "timeout": 30,
+  "headers": {"Authorization": "Bearer $SECGUARD_TOKEN"}
+}
+```
+
+Endpoints:
+- `POST /hook/guard` — destructive command check
+- `POST /hook/secrets-scan` — credential redaction (Claude/Gemini; Codex block-only)
+- `GET /healthz`, `/readyz` — k8s probes
+- `GET /metrics` — Prometheus counters + latency histograms
+
+## Telemetry
+
+Every hook invocation writes a JSONL line to `~/.secguard/telemetry.jsonl`:
+
+```json
+{"ts":"2026-04-19T07:00:00Z","mode":"guard","tool_name":"Bash","command":"rm -rf /","verdict":"destructive","verdict_source":"heuristic","reason":"rm -rf (recursive force delete)","latency_us":42,"target":"claude"}
+```
+
+Disable with `SECGUARD_TELEMETRY=off`. Useful for false-positive analysis and training data collection.
 
 ## Standalone usage
 
@@ -154,7 +196,8 @@ secguard scan --dir ./src --format json
 secguard-brain     GGUF inference engine (llama.cpp, optional Metal GPU)
 secguard-secrets   68 regex patterns + entropy detection + ML fallback
 secguard-guard     policy allowlist + 40 heuristic rules + ML classifier
-secguard-cli       CLI binary, Claude Code hook protocol
+secguard-cli       CLI binary, Claude Code / Codex / Gemini hook protocols
+secguard-server    axum HTTP server with Prometheus metrics + bearer auth
 ```
 
 Default build (`cargo install secguard-cli`) includes L1 (regex) and L2 (heuristic) only. Zero native dependencies.
