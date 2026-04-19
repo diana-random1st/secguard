@@ -47,3 +47,10 @@ serviceAccount:
 
 # Optional GuardConfig JSON override
 guardConfig: {}
+
+# Prometheus Operator ServiceMonitor for /metrics scraping
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
