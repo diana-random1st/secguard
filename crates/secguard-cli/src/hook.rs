@@ -2,6 +2,7 @@
 
 use std::io::Read;
 
+use crate::cmd_update;
 use crate::telemetry;
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -37,6 +38,11 @@ pub fn run(mode: HookMode, target: HookTarget) -> anyhow::Result<()> {
     std::io::stdin().read_to_string(&mut input)?;
 
     let v: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::json!({}));
+
+    // Cheap update surface: emit one-line notice if a marker is present,
+    // then maybe fork a detached background check (throttled 7d).
+    cmd_update::notify_if_available();
+    cmd_update::maybe_background_check();
 
     match mode {
         HookMode::SecretsScan => run_secrets_scan(&v, target),

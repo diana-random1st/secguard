@@ -4,6 +4,7 @@ mod cmd_guard;
 mod cmd_init;
 pub(crate) mod cmd_model;
 mod cmd_scan;
+pub(crate) mod cmd_update;
 mod hook;
 mod telemetry;
 
@@ -43,8 +44,11 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = hook::HookTarget::Claude)]
         target: hook::HookTarget,
     },
-    /// Download ML models from GitHub Releases
+    /// Download optional ML model bundles from Hugging Face
     Model {
+        /// Model bundle to install
+        #[arg(long, value_enum, default_value_t = cmd_model::ModelTarget::Guard)]
+        model: cmd_model::ModelTarget,
         /// Target directory (default: ~/.secguard/models/)
         #[arg(long)]
         dir: Option<String>,
@@ -58,6 +62,15 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
+    /// Check for a newer release on GitHub and optionally self-update
+    Update {
+        /// Only print the status; do not download or replace the binary.
+        #[arg(long)]
+        check_only: bool,
+        /// Detached background mode: write ~/.secguard/.update-available and exit silently.
+        #[arg(long, hide = true)]
+        background: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,8 +81,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Scan { dir, format } => cmd_scan::run(dir, &format),
         Commands::Guard { command } => cmd_guard::run(command),
         Commands::Hook { mode, target } => hook::run(mode, target),
-        Commands::Model { dir } => cmd_model::run(dir),
+        Commands::Model { model, dir } => cmd_model::run(dir, model),
         Commands::Init { target, global } => cmd_init::run(target, global),
+        Commands::Update {
+            check_only,
+            background,
+        } => cmd_update::run(check_only, background),
     };
 
     // Flush stdout/stderr then use _exit to skip C++ global destructors that

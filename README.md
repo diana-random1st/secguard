@@ -122,13 +122,30 @@ If hook support is not enabled in `config.toml`, `secguard` prints a warning but
 
 Project-level install (without `--global`) writes to `.codex/hooks.json` in the current directory and checks `.codex/config.toml` in the same directory.
 
-## ML model (optional)
+## ML models (optional)
 
 ```bash
 secguard model
 ```
 
 Downloads `secguard-guard.gguf` (~800 MB, Qwen3.5-0.8B fine-tuned, Q8 GGUF) from [HuggingFace](https://huggingface.co/random1st/secguard-models) to `~/.secguard/models/`. The guard works fine without it; the model catches edge cases that heuristics don't cover.
+
+OpenAI Privacy Filter can be installed as a separate local bundle:
+
+```bash
+secguard model --model privacy-filter
+```
+
+This downloads the q4 ONNX bundle from [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) to `~/.secguard/models/openai-privacy-filter/`. It is a PII token-classification model for external local redaction runtimes; the current Rust secrets scanner does not automatically execute this model.
+
+## Self-update
+
+```bash
+secguard update              # check GitHub Releases; download + atomically replace if newer
+secguard update --check-only # print status, don't touch the binary
+```
+
+The hook path also runs a throttled (once per 7 days) detached check in the background and, on subsequent invocations, prints a single stderr line if a newer release is available. The marker lives at `~/.secguard/.update-available`. Nothing is downloaded or replaced without an explicit `secguard update`.
 
 ## HTTP server & k8s deployment
 
