@@ -481,5 +481,5 @@ fn version_flag() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.3.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
