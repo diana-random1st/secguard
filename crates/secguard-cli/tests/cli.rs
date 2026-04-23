@@ -465,10 +465,21 @@ fn help_shows_all_commands() {
 }
 
 #[test]
+fn model_help_shows_privacy_filter_option() {
+    secguard()
+        .args(["model", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--model"))
+        .stdout(predicate::str::contains("guard"))
+        .stdout(predicate::str::contains("privacy-filter"));
+}
+
+#[test]
 fn version_flag() {
     secguard()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("0.3.0"));
 }

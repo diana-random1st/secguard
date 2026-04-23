@@ -307,7 +307,7 @@ fn maybe_offer_model_download() -> anyhow::Result<()> {
         if std::io::stdin().read_line(&mut answer).is_ok() {
             let answer = answer.trim().to_lowercase();
             if answer.is_empty() || answer == "y" || answer == "yes" {
-                crate::cmd_model::run(None)?;
+                crate::cmd_model::run(None, crate::cmd_model::ModelTarget::Guard)?;
             } else {
                 eprintln!("Skipped. Run `secguard model` later to download.");
             }
