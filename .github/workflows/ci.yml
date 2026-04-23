@@ -31,3 +31,25 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  model-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache secguard-guard.gguf
+        uses: actions/cache@v4
+        with:
+          path: ~/.secguard/models/secguard-guard.gguf
+          key: secguard-guard-gguf-v1
+      - name: Download secguard-guard.gguf if missing
+        run: |
+          mkdir -p ~/.secguard/models
+          if [ ! -s ~/.secguard/models/secguard-guard.gguf ]; then
+            curl -fSL --retry 3 -o ~/.secguard/models/secguard-guard.gguf \
+              https://huggingface.co/random1st/secguard-models/resolve/main/secguard-guard.gguf
+          fi
+          ls -lh ~/.secguard/models/
+      - run: cargo test --features ml -p secguard-guard --test model_smoke -- --nocapture
