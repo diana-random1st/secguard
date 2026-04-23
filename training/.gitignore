@@ -1,7 +1,8 @@
 data/
 splits/
 adapters/
-adapters-2b/
+adapters-*/
 fused-model/
-fused-model-2b/
+fused-model-*/
+logs/
 *.gguf

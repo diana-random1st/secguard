@@ -26,7 +26,17 @@ pub enum Verdict {
 pub enum VerdictSource {
     Policy,
     Heuristic,
+    /// Brain returned destructive with confidence >= threshold.
     Brain,
+    /// Brain ran, label was safe.
+    BrainSafe,
+    /// Brain returned destructive but confidence < threshold — treated as safe.
+    BrainLowConfidence,
+    /// Model file missing or init failed.
+    BrainNotLoaded,
+    /// Model loaded but produced a token outside the valid label set.
+    BrainMalformed,
+    /// ML feature not compiled in; heuristic/policy did not trigger.
     Default,
 }
 
@@ -68,14 +78,37 @@ pub fn check_detailed(cmd: &str, config: &GuardConfig) -> VerdictDetail {
     }
 
     #[cfg(feature = "ml")]
-    if let Some((reason, confidence)) = brain::check_destructive_detailed(cmd) {
-        return VerdictDetail {
-            verdict: Verdict::Destructive(reason),
-            source: VerdictSource::Brain,
-            confidence: Some(confidence),
+    {
+        return match brain::classify(cmd) {
+            brain::BrainOutcome::Destructive { reason, confidence } => VerdictDetail {
+                verdict: Verdict::Destructive(reason),
+                source: VerdictSource::Brain,
+                confidence: Some(confidence),
+            },
+            brain::BrainOutcome::LowConfidence { confidence } => VerdictDetail {
+                verdict: Verdict::Safe,
+                source: VerdictSource::BrainLowConfidence,
+                confidence: Some(confidence),
+            },
+            brain::BrainOutcome::Safe { confidence } => VerdictDetail {
+                verdict: Verdict::Safe,
+                source: VerdictSource::BrainSafe,
+                confidence: Some(confidence),
+            },
+            brain::BrainOutcome::NotLoaded => VerdictDetail {
+                verdict: Verdict::Safe,
+                source: VerdictSource::BrainNotLoaded,
+                confidence: None,
+            },
+            brain::BrainOutcome::MalformedOutput => VerdictDetail {
+                verdict: Verdict::Safe,
+                source: VerdictSource::BrainMalformed,
+                confidence: None,
+            },
         };
     }
 
+    #[allow(unreachable_code)]
     VerdictDetail {
         verdict: Verdict::Safe,
         source: VerdictSource::Default,

@@ -47,19 +47,50 @@ pub fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = d.as_secs();
+    let days = (secs / 86_400) as i64;
+    let (y, mo, day) = civil_from_days(days);
     let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
+    let mi = (secs / 60) % 60;
     let s = secs % 60;
-    // Simple UTC timestamp — no chrono dependency
-    format!(
-        "{}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        1970 + secs / 31_557_600,              // approximate year
-        ((secs % 31_557_600) / 2_629_800) + 1, // approximate month
-        ((secs % 2_629_800) / 86_400) + 1,     // approximate day
-        h,
-        m,
-        s
-    )
+    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Civil calendar date from days since 1970-01-01. Hinnant's algorithm.
+/// Correct for any proleptic Gregorian date.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = (y + if m <= 2 { 1 } else { 0 }) as i32;
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn epoch_is_1970_01_01() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn leap_day_2024() {
+        // 2024-02-29 = day 19782 since epoch
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn known_date_2026_04_23() {
+        // 2026-04-23 = day 20566 since epoch
+        assert_eq!(civil_from_days(20566), (2026, 4, 23));
+    }
 }
 
 pub fn emit_guard(event: &GuardEvent) {

@@ -1035,6 +1035,7 @@ dependencies = [
  "clap",
  "dirs",
  "env_logger",
+ "libc",
  "log",
  "predicates",
  "secguard-brain",

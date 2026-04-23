@@ -1,0 +1,23 @@
+model: "Qwen/Qwen3.5-0.8B"
+train: true
+data: "splits"
+seed: 42
+lora_layers: 16
+lora_parameters:
+  keys: ["self_attn.q_proj", "self_attn.v_proj", "self_attn.k_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+  rank: 16
+  alpha: 32
+  scale: 10.0
+  dropout: 0.05
+batch_size: 4
+iters: 1000
+learning_rate: 1e-5
+steps_per_report: 50
+steps_per_eval: 200
+save_every: 500
+val_batches: 25
+max_seq_length: 512
+grad_checkpoint: true
+adapter_path: "adapters-0.8b"
+test: true
+test_batches: -1

@@ -13,7 +13,7 @@ datasets:
 pipeline_tag: text-classification
 ---
 
-# secguard-guard -- Shell Command Safety Classifier
+# secguard-guard — Shell Command Safety Classifier
 
 Binary classifier for shell commands: **safe** vs **destructive**.
 
@@ -21,21 +21,34 @@ Binary classifier for shell commands: **safe** vs **destructive**.
 
 | Property | Value |
 |----------|-------|
-| Base model | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) |
-| Fine-tuning | LoRA (rank 8, 2.8M trainable params / 1.88B total) |
+| Base model | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
+| Fine-tuning | LoRA (rank 16, α=32, 4.26M trainable / 752M total) |
 | Quantization | Q8_0 (GGUF) |
-| Size | 1.9 GB |
+| Size | ~800 MB |
 | Context | 512 tokens |
 | Inference | llama.cpp / llama-cpp-rs |
 
 ## Training
 
-- **Dataset**: 21,430 labeled examples (balanced 50/50)
+- **Dataset**: 21,430 labeled examples (balanced 50/50, ChatML format)
   - **Destructive** (10,715): SSH-Shell-Attacks honeypot commands (ML4Net, 408K sessions) + synthetic SaaS CLI patterns
   - **Safe** (10,715): NL2Bash corpus (12.6K real admin commands) + synthetic dev/ops commands
-- **Method**: MLX LoRA, 8 layers, batch 4, lr 5e-5, 400 iterations
-- **Loss**: Train 0.388, Val 0.394
-- **Hardware**: Apple Silicon (M-series), ~12 minutes training
+- **Method**: MLX LoRA, 16 layers, batch 4, lr 1e-5, 1000 iterations
+- **Loss**: Train 0.393, Val 0.401 (best at iter 400)
+- **Test accuracy**: 98.8% (500 held-out examples; precision 99.2%, recall 98.4%, F1 0.988)
+- **Hardware**: Apple Silicon M3 Max, ~30 minutes training
+
+## Notes on inference
+
+Qwen3.5 reasoning models emit `<think>…</think>` blocks before the final answer.
+The runtime (`secguard-brain`) strips the thinking block via `rfind("</think>")`
+before matching the label, so the model is used as a classifier without
+retraining to suppress reasoning.
+
+The MLX → GGUF pipeline requires three post-processing fixes for Qwen3.5
+(tensor name rename, conv1d transpose, norm −1). Without them, the model
+produces multilingual token salad. This GGUF was produced through the fixed
+pipeline.
 
 ## What it detects
 
@@ -51,19 +64,21 @@ Commands the model learns to classify as **destructive**:
 ## Usage with secguard
 
 This model is Phase 3 (ML brain) in secguard's three-phase guard:
-1. **Policy allowlist** -- known-safe commands (zero latency)
-2. **Heuristic rules** -- 40+ regex patterns (zero latency)
-3. **ML brain** -- this model (catches what rules miss)
+1. **Policy allowlist** — known-safe commands (zero latency)
+2. **Heuristic rules** — 40+ regex patterns (zero latency)
+3. **ML brain** — this model (catches what rules miss)
 
 ```bash
-secguard model
+secguard model     # downloads this GGUF to ~/.secguard/models/
+secguard init --global     # installs Claude Code / Gemini / Codex hooks
 ```
 
 ## Limitations
 
 - Trained on English commands only
-- SSH honeypot data may not represent all attack vectors
-- Confidence threshold: 85% (tunable in secguard config)
+- SSH honeypot data doesn't represent all attack vectors
+- Confidence threshold: 0.85 (tunable in secguard config)
+- Below threshold → verdict falls through to safe (heuristic stays as backstop)
 
 ## License
 

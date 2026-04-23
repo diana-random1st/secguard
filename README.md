@@ -27,7 +27,7 @@ Two guards, three levels of detection each.
 
 `rm -rf build`, `rm -rf node_modules`, `rm -rf target/debug` are safe by default. Configurable via `GuardConfig`.
 
-*Phase 2: ML brain.* Qwen3.5-2B-F16 GGUF model (fine-tuned LoRA on 21K labeled commands) classifies commands the heuristics don't cover. 85% confidence threshold. Optional; falls back to heuristic-only when absent.
+*Phase 2: ML brain.* Qwen3.5-0.8B Q8 GGUF (~800 MB, fine-tuned LoRA on 21K labeled commands) classifies commands the heuristics don't cover. 85% confidence threshold. Optional; falls back to heuristic-only when absent.
 
 ## How to use it
 
@@ -128,7 +128,7 @@ Project-level install (without `--global`) writes to `.codex/hooks.json` in the 
 secguard model
 ```
 
-Downloads `secguard-guard.gguf` (3.8GB, Qwen3.5-2B fine-tuned, F16 GGUF) from [HuggingFace](https://huggingface.co/random1st/secguard-models) to `~/.secguard/models/`. The guard works fine without it; the model catches edge cases that heuristics don't cover.
+Downloads `secguard-guard.gguf` (~800 MB, Qwen3.5-0.8B fine-tuned, Q8 GGUF) from [HuggingFace](https://huggingface.co/random1st/secguard-models) to `~/.secguard/models/`. The guard works fine without it; the model catches edge cases that heuristics don't cover.
 
 ## HTTP server & k8s deployment
 

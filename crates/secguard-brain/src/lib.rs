@@ -230,7 +230,7 @@ impl MicroBrain {
             .ok()?;
         output.push_str(&String::from_utf8_lossy(&piece_bytes));
 
-        let trimmed = output.trim().to_lowercase();
+        let trimmed = Self::strip_think(&output).trim().to_lowercase();
         if self.valid_labels.contains(&trimmed) {
             return Some((trimmed, confidence));
         }
@@ -257,7 +257,7 @@ impl MicroBrain {
                 .ok()?;
             output.push_str(&String::from_utf8_lossy(&piece));
 
-            let trimmed = output.trim().to_lowercase();
+            let trimmed = Self::strip_think(&output).trim().to_lowercase();
             if self.valid_labels.contains(&trimmed) {
                 return Some((trimmed, confidence));
             }
@@ -272,13 +272,28 @@ impl MicroBrain {
             n_cur += 1;
         }
 
-        let label = output.trim().to_lowercase();
+        let label = Self::strip_think(&output).trim().to_lowercase();
         if self.valid_labels.contains(&label) {
             Some((label, confidence))
         } else {
+            warn!(
+                "brain: malformed output (expected one of {:?}, got {:?} — raw={:?})",
+                self.valid_labels, label, output
+            );
             None
         }
     }
+
+/// Strip Qwen3 `<think>...</think>` reasoning block. Qwen3 reasoning models emit
+/// an optional `<think>…</think>` block before the answer. We want only the
+/// content after `</think>`. If no closing tag, return the original (trimmed).
+fn strip_think(output: &str) -> &str {
+    if let Some(idx) = output.rfind("</think>") {
+        output[idx + "</think>".len()..].trim_start()
+    } else {
+        output.trim_start()
+    }
+}
 
     pub fn classify_with_prompt(
         &self,
