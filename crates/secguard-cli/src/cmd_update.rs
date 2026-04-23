@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GITHUB_API: &str =
-    "https://api.github.com/repos/diana-random1st/secguard/releases/latest";
+const GITHUB_API: &str = "https://api.github.com/repos/diana-random1st/secguard/releases/latest";
 const USER_AGENT: &str = "secguard-cli";
 pub const CHECK_INTERVAL_SECS: u64 = 7 * 86_400; // 7 days
 
@@ -79,8 +78,8 @@ fn fetch_latest() -> anyhow::Result<LatestRelease> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("no tag_name in release response"))?
         .to_string();
-    let target = detect_target()
-        .ok_or_else(|| anyhow::anyhow!("unsupported target for auto-update"))?;
+    let target =
+        detect_target().ok_or_else(|| anyhow::anyhow!("unsupported target for auto-update"))?;
     let asset_url = body
         .get("assets")
         .and_then(|v| v.as_array())
@@ -99,25 +98,61 @@ fn fetch_latest() -> anyhow::Result<LatestRelease> {
     Ok(LatestRelease { tag, asset_url })
 }
 
+// --- Internal helpers that take the cache dir explicitly. Kept here so tests
+// can exercise them against a tempdir without touching $HOME. ---
+
+fn touch_last_check_in(dir: &Path, now: u64) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(".update-last-check"), now.to_string())?;
+    Ok(())
+}
+
+fn last_check_stale_in(dir: &Path, now: u64, interval: u64) -> bool {
+    match fs::read_to_string(dir.join(".update-last-check")) {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(|t| now.saturating_sub(t) > interval)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn write_marker_in(dir: &Path, tag: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(".update-available"), tag)?;
+    Ok(())
+}
+
+fn clear_marker_in(dir: &Path) {
+    let _ = fs::remove_file(dir.join(".update-available"));
+}
+
+fn read_marker_in(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join(".update-available"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// --- Public-ish wrappers that resolve the default cache dir. ---
+
 /// Write the timestamp so the next check is throttled.
 fn touch_last_check() {
     let Some(dir) = cache_dir() else { return };
-    let _ = fs::create_dir_all(&dir);
     if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let _ = fs::write(dir.join(".update-last-check"), d.as_secs().to_string());
+        let _ = touch_last_check_in(&dir, d.as_secs());
     }
 }
 
 fn write_available_marker(tag: &str) -> anyhow::Result<()> {
     let dir = cache_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join(".update-available"), tag)?;
-    Ok(())
+    write_marker_in(&dir, tag)
 }
 
 fn clear_available_marker() {
     if let Some(dir) = cache_dir() {
-        let _ = fs::remove_file(dir.join(".update-available"));
+        clear_marker_in(&dir);
     }
 }
 
@@ -217,7 +252,10 @@ pub fn run(check_only: bool, background: bool) -> anyhow::Result<()> {
     );
     download_and_replace(&latest.asset_url)?;
     clear_available_marker();
-    eprintln!("Updated. New binary at {}", std::env::current_exe()?.display());
+    eprintln!(
+        "Updated. New binary at {}",
+        std::env::current_exe()?.display()
+    );
     Ok(())
 }
 
@@ -225,20 +263,16 @@ pub fn run(check_only: bool, background: bool) -> anyhow::Result<()> {
 /// present. Microseconds of stat+read; zero network.
 pub fn notify_if_available() {
     let Some(dir) = cache_dir() else { return };
-    let marker = dir.join(".update-available");
-    if let Ok(tag) = fs::read_to_string(&marker) {
-        let tag = tag.trim();
-        if !tag.is_empty() {
-            let local = env!("CARGO_PKG_VERSION");
-            if is_newer(tag, local) {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "[secguard] update available: {tag} (current v{local}) — run `secguard update`"
-                );
-            } else {
-                // Marker is stale (we already match or exceed). Clean up.
-                let _ = fs::remove_file(&marker);
-            }
+    let local = env!("CARGO_PKG_VERSION");
+    if let Some(tag) = read_marker_in(&dir) {
+        if is_newer(&tag, local) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[secguard] update available: {tag} (current v{local}) — run `secguard update`"
+            );
+        } else {
+            // Marker is stale (we already match or exceed). Clean up.
+            clear_marker_in(&dir);
         }
     }
 }
@@ -249,25 +283,15 @@ pub fn notify_if_available() {
 /// fan out multiple checks.
 pub fn maybe_background_check() {
     let Some(dir) = cache_dir() else { return };
-    let last_check = dir.join(".update-last-check");
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => return,
     };
-    let stale = match fs::read_to_string(&last_check) {
-        Ok(s) => s
-            .trim()
-            .parse::<u64>()
-            .map(|t| now.saturating_sub(t) > CHECK_INTERVAL_SECS)
-            .unwrap_or(true),
-        Err(_) => true,
-    };
-    if !stale {
+    if !last_check_stale_in(&dir, now, CHECK_INTERVAL_SECS) {
         return;
     }
     // Reserve the timestamp slot early to prevent fan-out from parallel hooks.
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(&last_check, now.to_string());
+    let _ = touch_last_check_in(&dir, now);
 
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -283,6 +307,7 @@ pub fn maybe_background_check() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn version_parsing() {
@@ -290,6 +315,7 @@ mod tests {
         assert_eq!(version_tuple("1.2.3"), Some((1, 2, 3)));
         assert_eq!(version_tuple("v0.3"), None);
         assert_eq!(version_tuple("garbage"), None);
+        assert_eq!(version_tuple("  v1.0.0  "), Some((1, 0, 0)));
     }
 
     #[test]
@@ -298,5 +324,70 @@ mod tests {
         assert!(is_newer("v1.0.0", "0.9.99"));
         assert!(!is_newer("v0.3.0", "0.3.0"));
         assert!(!is_newer("v0.2.5", "0.3.0"));
+        assert!(!is_newer("garbage", "0.3.0"));
+        assert!(!is_newer("v0.3.1", "bogus"));
+    }
+
+    #[test]
+    fn target_detection_supports_current_host() {
+        // The test must run on exactly one of our three supported targets.
+        assert!(detect_target().is_some());
+    }
+
+    #[test]
+    fn sibling_path() {
+        let p = std::path::Path::new("/tmp/secguard");
+        let s = sibling(p, ".new").unwrap();
+        assert_eq!(s, std::path::Path::new("/tmp/secguard.new"));
+    }
+
+    #[test]
+    fn marker_round_trip() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        assert_eq!(read_marker_in(dir.path()), None);
+
+        write_marker_in(dir.path(), "v1.2.3").unwrap();
+        assert_eq!(read_marker_in(dir.path()).as_deref(), Some("v1.2.3"));
+
+        clear_marker_in(dir.path());
+        assert_eq!(read_marker_in(dir.path()), None);
+    }
+
+    #[test]
+    fn marker_ignores_empty() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        write_marker_in(dir.path(), "   \n").unwrap();
+        assert_eq!(read_marker_in(dir.path()), None);
+    }
+
+    #[test]
+    fn last_check_stale_when_missing() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        // No file at all → stale.
+        assert!(last_check_stale_in(dir.path(), 1_000, 60));
+    }
+
+    #[test]
+    fn last_check_stale_when_old() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        touch_last_check_in(dir.path(), 100).unwrap();
+        // now=1000, interval=60 → 1000-100=900 > 60 → stale
+        assert!(last_check_stale_in(dir.path(), 1_000, 60));
+    }
+
+    #[test]
+    fn last_check_fresh_when_recent() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        touch_last_check_in(dir.path(), 990).unwrap();
+        // 1000-990=10 ≤ 60 → fresh
+        assert!(!last_check_stale_in(dir.path(), 1_000, 60));
+    }
+
+    #[test]
+    fn last_check_stale_on_garbage() {
+        let dir: TempDir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".update-last-check"), "not-a-number").unwrap();
+        // Unparseable → treated as stale.
+        assert!(last_check_stale_in(dir.path(), 1_000, 60));
     }
 }

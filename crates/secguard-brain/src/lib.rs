@@ -284,16 +284,16 @@ impl MicroBrain {
         }
     }
 
-/// Strip Qwen3 `<think>...</think>` reasoning block. Qwen3 reasoning models emit
-/// an optional `<think>…</think>` block before the answer. We want only the
-/// content after `</think>`. If no closing tag, return the original (trimmed).
-fn strip_think(output: &str) -> &str {
-    if let Some(idx) = output.rfind("</think>") {
-        output[idx + "</think>".len()..].trim_start()
-    } else {
-        output.trim_start()
+    /// Strip Qwen3 `<think>...</think>` reasoning block. Qwen3 reasoning models emit
+    /// an optional `<think>…</think>` block before the answer. We want only the
+    /// content after `</think>`. If no closing tag, return the original (trimmed).
+    fn strip_think(output: &str) -> &str {
+        if let Some(idx) = output.rfind("</think>") {
+            output[idx + "</think>".len()..].trim_start()
+        } else {
+            output.trim_start()
+        }
     }
-}
 
     pub fn classify_with_prompt(
         &self,

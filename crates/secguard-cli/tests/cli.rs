@@ -483,3 +483,22 @@ fn version_flag() {
         .success()
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
+
+#[test]
+fn update_help_shows_check_only_flag() {
+    secguard()
+        .args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--check-only"))
+        .stdout(predicate::str::contains("do not download"));
+}
+
+#[test]
+fn help_lists_update_subcommand() {
+    secguard()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update"));
+}
