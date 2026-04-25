@@ -44,12 +44,24 @@ fn guard_destructive_reset_hard() {
 
 #[test]
 fn guard_destructive_drop_table() {
-    // Note: "psql" alone is safe by policy (DB client connection).
-    // DROP TABLE is caught when not wrapped in psql.
     secguard()
-        .args(["guard", "echo 'DROP TABLE users' | mysql"])
+        .args(["guard", "psql -c 'DROP TABLE users'"])
         .assert()
         .code(1);
+}
+
+#[test]
+fn guard_destructive_kill_pid() {
+    secguard().args(["guard", "kill 12345"]).assert().code(1);
+}
+
+#[test]
+fn guard_safe_pkill_configured_target() {
+    secguard()
+        .args(["guard", "pkill node"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("safe"));
 }
 
 #[test]
@@ -159,6 +171,20 @@ fn scan_detects_jwt() {
     secguard().arg("scan").write_stdin(jwt).assert().code(1);
 }
 
+#[test]
+fn scan_dir_detects_secret_in_dotfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+    std::fs::write(dir.path().join(".env"), format!("AWS_ACCESS_KEY_ID={key}")).unwrap();
+
+    secguard()
+        .args(["scan", "--dir", dir.path().to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(".env"))
+        .stderr(predicate::str::contains("aws_access_key"));
+}
+
 // ── Hook protocol ────────────────────────────────────────────────────────────
 
 #[test]
@@ -188,6 +214,40 @@ fn hook_guard_destructive_bash() {
         .success()
         .stdout(predicate::str::contains("permissionDecision"))
         .stdout(predicate::str::contains("ask"));
+}
+
+#[test]
+fn hook_guard_long_unicode_command_does_not_panic() {
+    let command = format!("git reset --hard {}", "ж".repeat(300));
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("permissionDecision"))
+        .stdout(predicate::str::contains("ask"));
+}
+
+#[test]
+fn hook_guard_destructive_warning_redacts_secret() {
+    let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": format!("git reset --hard {key}") }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[REDACTED:aws_access_key]"))
+        .stdout(predicate::str::contains(key.clone()).not())
+        .stderr(predicate::str::contains("[REDACTED:aws_access_key]"))
+        .stderr(predicate::str::contains(key).not());
 }
 
 #[test]

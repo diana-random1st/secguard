@@ -67,6 +67,10 @@ pub fn check_destructive(cmd: &str, config: &GuardConfig) -> Option<String> {
         return Some("SQL destructive operation (DROP/TRUNCATE)".into());
     }
 
+    if let Some(reason) = check_unsafe_kill(cmd, config) {
+        return Some(reason);
+    }
+
     if cmd.contains("docker system prune") || cmd.contains("docker volume prune") {
         return Some("docker prune (removes containers/volumes permanently)".into());
     }
@@ -100,6 +104,17 @@ pub fn check_destructive(cmd: &str, config: &GuardConfig) -> Option<String> {
         return Some(reason);
     }
 
+    None
+}
+
+fn check_unsafe_kill(cmd: &str, config: &GuardConfig) -> Option<String> {
+    for part in crate::policy::split_command_parts(cmd) {
+        if crate::policy::is_kill_command(part)
+            && !crate::policy::is_safe_kill_command(part, config)
+        {
+            return Some("process termination outside safe_kill_targets".into());
+        }
+    }
     None
 }
 
@@ -255,6 +270,18 @@ mod tests {
     #[test]
     fn detect_drop_table() {
         assert!(check_destructive("psql -c 'DROP TABLE users'", &cfg()).is_some());
+    }
+
+    #[test]
+    fn detect_unsafe_kill() {
+        assert!(check_destructive("kill 12345", &cfg()).is_some());
+        assert!(check_destructive("pkill postgres", &cfg()).is_some());
+    }
+
+    #[test]
+    fn allow_safe_kill_target() {
+        assert!(check_destructive("pkill node", &cfg()).is_none());
+        assert!(check_destructive("killall python", &cfg()).is_none());
     }
 
     #[test]

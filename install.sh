@@ -30,13 +30,38 @@ if [ -z "${TAG}" ]; then
 fi
 echo "Release: ${TAG}"
 
-# Download and extract
-URL="https://github.com/${REPO}/releases/download/${TAG}/secguard-${TARGET}.tar.gz"
+# Download, verify, and extract
+ASSET="secguard-${TARGET}.tar.gz"
+URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+CHECKSUM_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums-sha256.txt"
 echo "Downloading ${URL}..."
 
 TMP=$(mktemp -d)
-curl -fL -# -o "${TMP}/secguard.tar.gz" "${URL}"
-tar xzf "${TMP}/secguard.tar.gz" -C "${TMP}"
+trap 'rm -rf "${TMP}"' EXIT
+curl -fL -# -o "${TMP}/${ASSET}" "${URL}"
+curl -fL -# -o "${TMP}/checksums-sha256.txt" "${CHECKSUM_URL}"
+
+CHECKSUM_LINE=$(grep "  ${ASSET}$" "${TMP}/checksums-sha256.txt" || true)
+if [ -z "${CHECKSUM_LINE}" ]; then
+    echo "Checksum manifest does not include ${ASSET}" >&2
+    exit 1
+fi
+printf '%s\n' "${CHECKSUM_LINE}" > "${TMP}/checksums-target.txt"
+
+echo "Verifying SHA-256..."
+(
+    cd "${TMP}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c checksums-target.txt
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c checksums-target.txt
+    else
+        echo "Neither sha256sum nor shasum is available for checksum verification" >&2
+        exit 1
+    fi
+)
+
+tar xzf "${TMP}/${ASSET}" -C "${TMP}"
 
 # Install
 if [ -w "${INSTALL_DIR}" ]; then
@@ -45,7 +70,6 @@ else
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
     sudo mv "${TMP}/secguard" "${INSTALL_DIR}/secguard"
 fi
-rm -rf "${TMP}"
 
 echo "Installed secguard ${TAG} to ${INSTALL_DIR}/secguard"
 

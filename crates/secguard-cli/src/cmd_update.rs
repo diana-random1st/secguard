@@ -55,7 +55,9 @@ fn is_newer(remote: &str, local: &str) -> bool {
 
 struct LatestRelease {
     tag: String,
+    asset_name: String,
     asset_url: String,
+    checksum_url: String,
 }
 
 fn fetch_latest() -> anyhow::Result<LatestRelease> {
@@ -80,22 +82,46 @@ fn fetch_latest() -> anyhow::Result<LatestRelease> {
         .to_string();
     let target =
         detect_target().ok_or_else(|| anyhow::anyhow!("unsupported target for auto-update"))?;
-    let asset_url = body
+    let assets = body
         .get("assets")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("no assets array"))?
+        .ok_or_else(|| anyhow::anyhow!("no assets array"))?;
+
+    let expected_asset_name = format!("secguard-{target}.tar.gz");
+    let asset = assets
         .iter()
         .find(|a| {
             a.get("name")
                 .and_then(|n| n.as_str())
-                .map(|n| n.contains(target))
+                .map(|n| n == expected_asset_name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no release asset for target {target}"))?;
+    let asset_url = asset
+        .get("browser_download_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("release asset missing download URL"))?
+        .to_string();
+
+    let checksum_url = assets
+        .iter()
+        .find(|a| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n == "checksums-sha256.txt")
                 .unwrap_or(false)
         })
         .and_then(|a| a.get("browser_download_url"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no release asset for target {target}"))?
+        .ok_or_else(|| anyhow::anyhow!("release is missing checksums-sha256.txt"))?
         .to_string();
-    Ok(LatestRelease { tag, asset_url })
+
+    Ok(LatestRelease {
+        tag,
+        asset_name: expected_asset_name,
+        asset_url,
+        checksum_url,
+    })
 }
 
 // --- Internal helpers that take the cache dir explicitly. Kept here so tests
@@ -156,22 +182,23 @@ fn clear_available_marker() {
     }
 }
 
-fn download_and_replace(asset_url: &str) -> anyhow::Result<()> {
+fn download_and_replace(
+    asset_url: &str,
+    asset_name: &str,
+    checksum_url: &str,
+) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe()?;
     let base_dir = cache_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     let tmp = base_dir.join(".update-tmp");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
 
-    let tar_path = tmp.join("release.tar.gz");
-    let status = Command::new("curl")
-        .args(["-fL", "-o"])
-        .arg(&tar_path)
-        .arg(asset_url)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("download failed for {asset_url}");
-    }
+    let tar_path = tmp.join(asset_name);
+    download_to(asset_url, &tar_path)?;
+
+    let checksum_path = tmp.join("checksums-sha256.txt");
+    download_to(checksum_url, &checksum_path)?;
+    verify_archive_checksum(&tar_path, asset_name, &checksum_path)?;
 
     let status = Command::new("tar")
         .args(["-xzf"])
@@ -199,6 +226,80 @@ fn download_and_replace(asset_url: &str) -> anyhow::Result<()> {
     fs::rename(&staged, &current_exe)?;
     let _ = fs::remove_dir_all(&tmp);
     Ok(())
+}
+
+fn download_to(url: &str, path: &Path) -> anyhow::Result<()> {
+    let status = Command::new("curl")
+        .args(["-fL", "-o"])
+        .arg(path)
+        .arg(url)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("download failed for {url}");
+    }
+    Ok(())
+}
+
+fn verify_archive_checksum(
+    tar_path: &Path,
+    asset_name: &str,
+    checksum_path: &Path,
+) -> anyhow::Result<()> {
+    let manifest = fs::read_to_string(checksum_path)?;
+    let expected = checksum_for_asset(&manifest, asset_name)
+        .ok_or_else(|| anyhow::anyhow!("checksum manifest missing {asset_name}"))?;
+    let actual = compute_sha256(tar_path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!("checksum mismatch for {asset_name}: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn checksum_for_asset<'a>(manifest: &'a str, asset_name: &str) -> Option<&'a str> {
+    manifest.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let checksum = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == asset_name && is_sha256_hex(checksum) {
+            Some(checksum)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    match Command::new("sha256sum").arg(path).output() {
+        Ok(out) if out.status.success() => checksum_from_tool_output(&out.stdout),
+        Ok(out) => anyhow::bail!("sha256sum failed with status {}", out.status),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let out = Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(path)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!("shasum failed with status {}", out.status);
+            }
+            checksum_from_tool_output(&out.stdout)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn checksum_from_tool_output(stdout: &[u8]) -> anyhow::Result<String> {
+    let output = std::str::from_utf8(stdout)?;
+    let checksum = output
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("checksum tool returned no output"))?;
+    if !is_sha256_hex(checksum) {
+        anyhow::bail!("checksum tool returned invalid SHA-256: {checksum}");
+    }
+    Ok(checksum.to_ascii_lowercase())
 }
 
 fn sibling(p: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
@@ -250,7 +351,7 @@ pub fn run(check_only: bool, background: bool) -> anyhow::Result<()> {
         "Updating secguard v{local} → {}\n  {}",
         latest.tag, latest.asset_url
     );
-    download_and_replace(&latest.asset_url)?;
+    download_and_replace(&latest.asset_url, &latest.asset_name, &latest.checksum_url)?;
     clear_available_marker();
     eprintln!(
         "Updated. New binary at {}",
@@ -339,6 +440,56 @@ mod tests {
         let p = std::path::Path::new("/tmp/secguard");
         let s = sibling(p, ".new").unwrap();
         assert_eq!(s, std::path::Path::new("/tmp/secguard.new"));
+    }
+
+    #[test]
+    fn checksum_manifest_selects_target_asset() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let manifest = format!(
+            "{hash}  secguard-x86_64-unknown-linux-gnu.tar.gz\n\
+             ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  secguard-aarch64-apple-darwin.tar.gz\n"
+        );
+
+        assert_eq!(
+            checksum_for_asset(&manifest, "secguard-x86_64-unknown-linux-gnu.tar.gz"),
+            Some(hash)
+        );
+    }
+
+    #[test]
+    fn checksum_manifest_accepts_shasum_marker() {
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let manifest = format!("{hash} *secguard-x86_64-apple-darwin.tar.gz\n");
+
+        assert_eq!(
+            checksum_for_asset(&manifest, "secguard-x86_64-apple-darwin.tar.gz"),
+            Some(hash)
+        );
+    }
+
+    #[test]
+    fn checksum_manifest_rejects_missing_or_invalid_hash() {
+        let manifest = "not-a-sha256  secguard-x86_64-unknown-linux-gnu.tar.gz\n";
+
+        assert_eq!(
+            checksum_for_asset(manifest, "secguard-x86_64-unknown-linux-gnu.tar.gz"),
+            None
+        );
+        assert_eq!(
+            checksum_for_asset(manifest, "secguard-aarch64-apple-darwin.tar.gz"),
+            None
+        );
+    }
+
+    #[test]
+    fn checksum_tool_output_parses_hash() {
+        let hash = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        let output = format!("{hash}  secguard.tar.gz\n");
+
+        assert_eq!(
+            checksum_from_tool_output(output.as_bytes()).unwrap(),
+            hash.to_ascii_lowercase()
+        );
     }
 
     #[test]

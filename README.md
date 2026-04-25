@@ -8,16 +8,16 @@ Built for [Claude Code](https://claude.ai/code), Gemini CLI, and Codex workflows
 
 Two guards, three levels of detection each.
 
-**Secrets scanning.** Catches credentials before they leak into logs, tool output, or cloud APIs. 68 regex patterns: AWS access keys (`AKIA*`), Stripe (`sk_live_*`, `pk_live_*`), GitHub PATs (`ghp_*`, `github_pat_*`), Anthropic/OpenAI API keys, Slack tokens, JWTs, private key blocks, database connection strings (postgres, mysql, mongodb, redis), SendGrid, Twilio, npm/PyPI tokens, generic `password=`/`secret=` assignments. Keyword pre-filter skips regex when no relevant substring exists (fast on large inputs). High-entropy token detection (Shannon entropy >= 3.5 bits/char, 16+ chars) picks up things regex misses. Optional ML classifier as final pass.
+**Secrets scanning.** Catches credentials before they leak into logs, tool output, or cloud APIs. 150+ regex patterns: AWS access keys (`AKIA*`), Stripe (`sk_live_*`, `pk_live_*`), GitHub PATs (`ghp_*`, `github_pat_*`), Anthropic/OpenAI API keys, Slack tokens, JWTs, private key blocks, database connection strings (postgres, mysql, mongodb, redis), SendGrid, Twilio, npm/PyPI tokens, generic `password=`/`secret=` assignments. Keyword pre-filter skips regex when no relevant substring exists (fast on large inputs). High-entropy token detection (Shannon entropy >= 3.5 bits/char, 16+ chars) picks up things regex misses. Optional ML classifier as final pass.
 
 **Destructive command guard.** Blocks commands that delete data, rewrite history, or bypass safety checks. Three phases run in order; first match wins:
 
-*Phase 0: Policy allowlist.* Some operations are always safe. Process management (`kill`, `pkill`), `git push` without `--force`, read-only kubectl (`get`, `describe`, `logs`), DB client connections (`psql`). Compound commands (`&&`, `||`, `;`, `|`) are split and every part must pass independently.
+*Phase 0: Policy allowlist.* Some operations are always safe. Configured process cleanup (`pkill`/`killall` targets from `safe_kill_targets`), `git push` without `--force`, and read-only kubectl (`get`, `describe`, `logs`) can pass here. Compound commands (`&&`, `||`, `;`, `|`) are split and every part must pass independently.
 
 *Phase 1: Heuristic rules.* 40+ patterns, zero latency:
 - Git: `checkout .`, `clean`, `reset --hard`, `push --force`, `branch -D`, `rebase`, `stash drop/clear`
 - Filesystem: `rm -rf` (with configurable safe paths for build dirs), `rm -r`, `find -delete`, `shred`
-- SQL: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE`
+- SQL: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE` (including commands run via database CLIs such as `psql`)
 - Docker: `system prune`, `volume prune`
 - Remote exec: `curl | bash`, `wget | sh`
 - Hook bypass: `--no-verify`
@@ -53,7 +53,7 @@ Seven modes, same codebase.
 curl -fsSL https://raw.githubusercontent.com/diana-random1st/secguard/main/install.sh | sh
 ```
 
-Detects OS/arch, downloads the right binary, installs to `/usr/local/bin`.
+Detects OS/arch, downloads the right binary, verifies it against `checksums-sha256.txt`, then installs to `/usr/local/bin`.
 
 Or manually pick your platform:
 
@@ -114,9 +114,10 @@ secguard init codex --global
 Checks `~/.codex/config.toml` for:
 - **hooks support** — expects `[features] codex_hooks = true`
 
-Then writes two `PreToolUse` hooks to `~/.codex/hooks.json`:
+Then writes one `PreToolUse` hook to `~/.codex/hooks.json`:
 - **guard** on Bash — checks commands before execution
-- **secrets-scan** on Bash/Edit/Write/Agent/MCP — redacts credentials from tool input
+
+Secrets-scan is intentionally not installed for Codex because the current `PreToolUse` hook contract can block tool calls but cannot rewrite tool input.
 
 If hook support is not enabled in `config.toml`, `secguard` prints a warning but still writes the hook file.
 
@@ -141,7 +142,7 @@ This downloads the q4 ONNX bundle from [openai/privacy-filter](https://huggingfa
 ## Self-update
 
 ```bash
-secguard update              # check GitHub Releases; download + atomically replace if newer
+secguard update              # check GitHub Releases; verify checksum; atomically replace if newer
 secguard update --check-only # print status, don't touch the binary
 ```
 
@@ -171,6 +172,8 @@ Then point Claude Code HTTP hooks to it:
 }
 ```
 
+The Helm chart requires bearer auth by default. For trusted local/dev clusters only, set `--set auth.required=false`.
+
 Endpoints:
 - `POST /hook/guard` — destructive command check
 - `POST /hook/secrets-scan` — credential redaction (Claude/Gemini; Codex block-only)
@@ -179,7 +182,7 @@ Endpoints:
 
 ## Telemetry
 
-Every hook invocation writes a JSONL line to `~/.secguard/telemetry.jsonl`:
+Every hook invocation writes a JSONL line to `~/.secguard/telemetry.jsonl`. Guard command text is redacted with the secrets scanner and truncated before it is written:
 
 ```json
 {"ts":"2026-04-19T07:00:00Z","mode":"guard","tool_name":"Bash","command":"rm -rf /","verdict":"destructive","verdict_source":"heuristic","reason":"rm -rf (recursive force delete)","latency_us":42,"target":"claude"}
@@ -211,7 +214,7 @@ secguard scan --dir ./src --format json
 
 ```
 secguard-brain     GGUF inference engine (llama.cpp, optional Metal GPU)
-secguard-secrets   68 regex patterns + entropy detection + ML fallback
+secguard-secrets   150+ regex patterns + entropy detection + ML fallback
 secguard-guard     policy allowlist + 40 heuristic rules + ML classifier
 secguard-cli       CLI binary, Claude Code / Codex / Gemini hook protocols
 secguard-server    axum HTTP server with Prometheus metrics + bearer auth

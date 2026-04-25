@@ -52,19 +52,16 @@ pub async fn guard(
                 })
                 .inc();
 
+            let display = redact_and_truncate(&text, &state.scanner, 200);
+
             log::info!(
                 "{{\"mode\":\"guard\",\"verdict\":\"destructive\",\"source\":{},\"command\":{},\"reason\":{},\"latency_ms\":{:.3}}}",
                 source,
-                serde_json::to_string(&text.chars().take(200).collect::<String>()).unwrap_or_default(),
+                serde_json::to_string(&display).unwrap_or_default(),
                 serde_json::to_string(reason).unwrap_or_default(),
                 elapsed * 1000.0,
             );
 
-            let display = if text.len() > 200 {
-                format!("{}...", &text[..197])
-            } else {
-                text
-            };
             let reason_text = format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
             let hook_event_name = response::incoming_hook_event_name(&body);
             let json = response::guard_block(state.target, &hook_event_name, &reason_text);
@@ -152,4 +149,22 @@ pub async fn secrets_scan(
     let hook_event_name = response::incoming_hook_event_name(&body);
     let json = response::secrets_redacted(state.target, &hook_event_name, &context, input_clone);
     (StatusCode::OK, Json(json))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn redact_and_truncate(
+    text: &str,
+    scanner: &secguard_secrets::Scanner,
+    max_chars: usize,
+) -> String {
+    let findings = scanner.scan(text);
+    truncate_chars(&secguard_secrets::redact(text, &findings), max_chars)
 }

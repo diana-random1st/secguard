@@ -73,15 +73,13 @@ fn walk_recursive(dir: &str, files: &mut Vec<String>) -> anyhow::Result<()> {
         let path = entry.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
 
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "__pycache__"
-        {
-            continue;
-        }
-
         if path.is_dir() {
+            if matches!(
+                name.as_ref(),
+                ".git" | ".hg" | ".svn" | "node_modules" | "target" | "__pycache__"
+            ) {
+                continue;
+            }
             walk_recursive(&path.to_string_lossy(), files)?;
         } else if path.is_file() {
             files.push(path.to_string_lossy().into_owned());

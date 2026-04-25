@@ -123,11 +123,7 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
         ts: telemetry::now_iso(),
         mode: "guard",
         tool_name: tool_name.to_string(),
-        command: if text_to_check.len() > 500 {
-            format!("{}...", &text_to_check[..497])
-        } else {
-            text_to_check.clone()
-        },
+        command: truncate_chars(&redact_command(&text_to_check), 500),
         verdict: verdict_str,
         verdict_source: serde_json::to_string(&detail.source)
             .unwrap_or_default()
@@ -140,11 +136,7 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
     });
 
     if let secguard_guard::Verdict::Destructive(reason) = detail.verdict {
-        let display = if text_to_check.len() > 200 {
-            format!("{}...", &text_to_check[..197])
-        } else {
-            text_to_check.clone()
-        };
+        let display = truncate_chars(&redact_command(&text_to_check), 200);
 
         let reason_text = format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
         eprintln!("[secguard] {reason_text}");
@@ -158,6 +150,42 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn redact_command(command: &str) -> String {
+    let scanner = secguard_secrets::Scanner::new();
+    let findings = scanner.scan(command);
+    secguard_secrets::redact(command, &findings)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_handles_utf8_boundaries() {
+        let text = "ж".repeat(201);
+        let truncated = truncate_chars(&text, 200);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.trim_end_matches("...").chars().count(), 200);
+    }
+
+    #[test]
+    fn redact_command_removes_detected_secrets() {
+        let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+        let redacted = redact_command(&format!("echo {key}"));
+        assert!(redacted.contains("[REDACTED:aws_access_key]"));
+        assert!(!redacted.contains(&key));
+    }
 }
 
 fn allow_response(

@@ -13,7 +13,9 @@ service:
 target: claude
 
 auth:
-  # Bearer token for /hook/* endpoints. If empty, auth is disabled.
+  # Require bearer auth for /hook/* endpoints. Set false only for trusted local/dev clusters.
+  required: true
+  # Bearer token for /hook/* endpoints.
   token: ""
   # Use an existing k8s Secret instead of creating one.
   # Secret must have key "token".

@@ -61,7 +61,7 @@ pub fn check_with_config(cmd: &str, config: &GuardConfig) -> Verdict {
 
 /// Classify with full detail (verdict + source + confidence).
 pub fn check_detailed(cmd: &str, config: &GuardConfig) -> VerdictDetail {
-    if policy::is_safe_by_policy(cmd) {
+    if policy::is_safe_by_policy(cmd, config) {
         return VerdictDetail {
             verdict: Verdict::Safe,
             source: VerdictSource::Policy,
