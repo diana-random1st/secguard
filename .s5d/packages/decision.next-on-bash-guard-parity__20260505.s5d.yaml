@@ -1,0 +1,309 @@
+s5d: '1.0'
+id: decision.next-on-bash-guard-parity
+version: 1.0.0
+product: secguard
+tier: decision
+allow_update: true
+meta:
+  title: Next step on bash-guard parity (rule-family expansion vs AST/wrapper vs defer)
+  authors:
+  - random1st
+  date: 2026-05-05
+  tickets:
+  - RAN-355
+  adrs: []
+  renames: []
+context: |-
+  After RAN-353 (commit 798130b — fixture corpus + shadow mode + rule_id telemetry)
+  and RAN-354 (commit 3aa08c2 — token-level rm operand classifier), the bash-guard
+  fixture baseline is 98/155 (63.2%). rm subgroup is 23/24 (96%). Remaining
+  failures cluster in three buckets:
+
+  Bucket-RuleFamily (~40 fixtures, 26% of corpus):
+    supabase 0/10 (alembic / drizzle / prisma / knex / goose migrations)
+    infra: 18 missing (terraform, mongo, redis, ES, gsutil, OCI/IBM/doctl)
+    paas: 6 missing (doctl, linode-cli, fly volumes destroy)
+    git: 9 missing (filter-branch, filter-repo, BFG, +refspec, push -d)
+    db_client: 3 missing (redis FLUSHALL, psql DELETE FROM)
+
+  Bucket-AST (~12 fixtures, 8% of corpus):
+    sudo / bash -c / eval / xargs / find -exec / ssh / chroot wrappers
+
+  Bucket-FP (~10 fixtures from substring fallback):
+    `git commit -m "rm -rf ..."` etc — false positives
+
+  RAN-355 (proposal 001) bundles AST + wrapper unwrap + asymmetric fail-open
+  + pipe-to-shell re-parse. Fixture-coverage gain: at most +12. Cost: parser
+  choice S5D, parser implementation, all rule families migrate to AST.
+  Bucket-RuleFamily would still need to ship separately afterwards.
+workflow: null
+artifacts: null
+links: null
+contracts: []
+gates:
+- kind: review
+roc: null
+problem:
+  signal: Original plan named AST + wrapper unwrap as next big rock. Fixture data after RAN-354 says rule-family expansion would close ~40 fixtures vs AST closes 12. But rule expansion does not fix the wrapper-FN bypass class. Need a decision on which path adds more SAFETY VALUE in the next 2 weeks.
+  constraints:
+  - 'License: Apache-2.0 + Commons-Clause-1.0; no GPL deps'
+  - Single Rust binary preferred; macOS + Linux; no extra system deps
+  - Must not regress 49 existing tests + fixture floor 95
+  - Tribunal-mandatory before any merge to main
+  - 'Time budget: ~2 calendar weeks for next chunk'
+  targets:
+  - Pick ONE direction for the next 2 weeks
+  - Define exit criteria (fixture target + class target)
+  - Address agent-bypass-via-wrapper attack path explicitly
+  indicators:
+  - fixture_baseline_after_chunk >= 110/155 (71%)
+  - at_least_one_rule_family_or_wrapper_class_closed
+  - real_world_FN_reports tracked post-ship
+  goodhart_guard: null
+  acceptance: Decision states next chunk, exit criteria, and explicitly addresses wrapper-bypass — either by closing it now or documenting why deferral is safe given Claude Code shows commands first.
+  blast_radius: null
+  reversibility: null
+  status: framing
+hypotheses:
+- id: rule-family-expansion-first
+  title: Ship rule-family expansion first; defer AST
+  content: |-
+    Spend 2 weeks adding ~8-10 missing rule families and tightening
+    substring FPs: supabase ORM migrations, terraform, redis FLUSH,
+    mongo destructive, ES/OpenSearch DELETE, gsutil rm, OCI/IBM/doctl,
+    git filter-branch/+refspec, plus tightening substring fallback to
+    skip `git commit -m "..."` content. Each rule ~50 LOC + tests.
+    Wrapper-FN bypass stays covered by current substring fallback
+    (conservatively asks rather than misses). AST stays queued in
+    proposal 001 for later.
+
+    Predictions: fixture baseline rises to 130+/155 (84%+). rm subgroup
+    holds at 23/24. Default-rule FPs drop from 10 to <5.
+
+    Decomposition: weak coupling, low hidden state, high reuse, low risk.
+    Mechanical work, well-bounded per rule.
+
+    Rigor: empirical (fixture deltas measurable per rule). Counter-
+    evidence: if a rule needs operand-aware parsing (mongo with JSON
+    args) we hit AST territory before completing rules.
+
+    Weakest link: wrapper-FN class stays open. An agent emitting
+    `sudo rm -rf $HOME` is caught only by substring fallback, which
+    flags any `rm -rf` substring as destructive — broadly safe but coarse.
+  scope: secguard heuristic phase, no parser change
+  kind: feature
+  layer: L2
+  r_eff: null
+  evidence:
+  - id: rule-family-fixture-math
+    type: internal
+    content: 'Fixture corpus shows 40 rule-family failures vs 12 wrapper failures. Closing 40 with regex >> closing 12 with parser change. Cost asymmetry: regex ~half-day per rule; parser ~2 weeks total.'
+    verdict: pass
+    valid_until: null
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - coverage
+    - cost
+    congruence_level: 2
+    reliability: 0.85
+    refine_kind: null
+  - id: rule-family-bash-guard-precedent
+    type: external
+    content: bash-guard ships 8 rule families (rm/git/infra/paas/db/supabase) in their MIT corpus. Their reason codes are well-defined and our taxonomy mirrors them. Porting is mostly translating their regex patterns.
+    verdict: pass
+    valid_until: null
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - feasibility
+    congruence_level: 2
+    reliability: 0.8
+    refine_kind: null
+  - id: 20260505-internal-rule-family-expansion-first
+    type: internal
+    content: 'Challenge probe #1 (counter-argument): ''wrapper bypass stays open''. Counter: substring fallback in heuristic.rs flags ANY cmd containing ''rm -rf'' regardless of wrapper. Conservative (asks on FP rather than misses on FN). Real bypass class is ''eval $VAR'' / dynamic args — these are rare in actual agent emissions per bash-guard threat model. Acceptable interim until RAN-355 ships.'
+    verdict: pass
+    valid_until: 2026-08-03T20:19:03.102617+00:00
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - security
+    congruence_level: null
+    reliability: 0.75
+    refine_kind: null
+  - id: 20260505-internal-rule-family-expansion-first
+    type: internal
+    content: 'Challenge probe #2 (tail failure): rule expansion may hit operand-parsing wall (mongo JSON args, terraform -target=resource[index]). Mitigation: tackle simplest first (terraform apply/destroy, redis FLUSHALL — single-keyword detection). Mongo''s JSON args is the hardest; document as ask-on-substring or defer until AST.'
+    verdict: warn
+    valid_until: 2026-08-03T20:19:05.792564+00:00
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - feasibility
+    congruence_level: null
+    reliability: 0.7
+    refine_kind: null
+  depends_on: []
+  rationale: null
+  spec_ref: feat.bash-guard-rule-expansion__20260505.s5d.yaml
+  prompt: null
+  next_move: null
+- id: ast-and-wrapper-unwrap
+  title: Build AST + wrapper unwrap next (RAN-355 as originally scoped)
+  content: |-
+    Treat AST as the architectural foundation. Run separate S5D for
+    parser choice (5 options in proposal 001). Implement minimum:
+    parser/span abstraction + wrapper unwrap (sudo, bash -c, eval,
+    xargs, find -exec, ssh, chroot, timeout, env, command, sh/zsh -c)
+    + asymmetric fail-open + pipe-to-shell literal re-parse. Migrate
+    rm.rs and heuristic.rs to consume parsed segments.
+
+    Predictions: ~12 wrapper fixtures pass. Heredoc/quoted FPs drop
+    via span classification. Parser S5D + spike + integration fits in
+    2 weeks. All 49 tests still pass.
+
+    Decomposition: tight coupling (every rule consuming raw string
+    needs refactor). Parser library has unknown long-tail risks.
+    Reuse low. Risk high — parser bugs become silent vulnerabilities.
+
+    Rigor: theoretical case strong (bash-guard design rationale,
+    tribunal #1 said AST should be first architectural target).
+    Empirical gain modest (+12 fixtures). Long-term maintainability
+    trades against short-term safety yield.
+
+    Weakest link: parser choice. Rust ecosystem has no maintained
+    bash-extension-aware parser. Every option has sharp edges.
+    Without working spike, commit here is partly speculative.
+  scope: secguard parser layer + heuristic refactor
+  kind: system
+  layer: L1
+  r_eff: null
+  evidence:
+  - id: ast-tribunal-recommendation
+    type: external
+    content: 'Tribunal 2026-05-04 (Codex+Gemini) unanimously recommended AST as first architectural target. Both auditors verified rm/policy substring approach has structural FP/FN. Codex: "core weakness is that the guard does not know what code is executed."'
+    verdict: pass
+    valid_until: null
+    carrier_ref: null
+    formality: 5
+    claim_scope:
+    - architecture
+    - security
+    congruence_level: 3
+    reliability: 0.9
+    refine_kind: null
+  - id: ast-wrapper-bypass-real-attack
+    type: external
+    content: 'Bash-guard DESIGN.md documents the wrapper-FN as a primary motivation: agents emit bash -c "..." to bypass simple detectors. RAN-354 substring fallback is a stop-gap; it cannot distinguish `rm -rf node_modules` (intent) from `bash -c "rm -rf /"` (concealment).'
+    verdict: pass
+    valid_until: null
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - threat-model
+    congruence_level: 2
+    reliability: 0.7
+    refine_kind: null
+  - id: ast-rust-parser-availability
+    type: external
+    content: 'Tribunal-1 verified: conch-parser (2018, abandoned, POSIX-only). tree-sitter-bash (mature, C runtime, known heredoc bugs #282/#283). nom/winnow custom parser (greenfield, parser bugs become CVEs). Go-sidecar with mvdan/sh (mature parser, breaks single-binary). bash -n (syntax-only, no spans). No clean choice exists.'
+    verdict: warn
+    valid_until: null
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - feasibility
+    congruence_level: 2
+    reliability: 0.85
+    refine_kind: null
+  - id: 20260505-internal-ast-and-wrapper-unwrap
+    type: internal
+    content: 'Challenge probe #1 + #5: A and B are not mutually exclusive in time. Doing A first (3 weeks max) does NOT delay B''s value because substring fallback is already conservative on wrapper class. Evidence-wise A''s empirical case (40 fixtures, low risk) outweighs B''s theoretical case (architectural correctness, +12 fixtures, parser-availability risk) for THIS chunk. B remains queued in proposal 001 with parser-spike as gate.'
+    verdict: warn
+    valid_until: 2026-08-03T20:19:09.786299+00:00
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - strategy
+    congruence_level: null
+    reliability: 0.85
+    refine_kind: null
+  depends_on: []
+  rationale: null
+  spec_ref: null
+  prompt: null
+  next_move: null
+- id: defer-collect-real-signal
+  title: Defer both; ship 0.4.0 with current state, collect production telemetry
+  content: |-
+    Fixture corpus is bash-guard's view of threat space, not secguard's
+    user base. Ship 0.4.0 with RAN-353/354. Encourage opt-in shadow mode
+    for 4 weeks. Collect would_decide telemetry. Decide next chunk based
+    on actual FN/FP distribution. Concrete next-2-weeks: fix worst 1-2
+    FPs, add terraform if obvious, publish 0.4.0, write shadow adoption
+    guide.
+
+    Predictions: production telemetry shows different rule-family weights
+    than fixtures imply. 0.4.0 shippable in 2-3 days. At least 3 user
+    instances enable shadow mode within 4 weeks.
+
+    Decomposition: minimal coupling, dependency on user adoption is real
+    risk. Maximum reuse. Opportunity cost — delays both A and B by a month.
+
+    Rigor: methodologically correct (instrument before optimizing).
+    Practically risky if adoption low: we wait for data that never arrives
+    then have to choose anyway, having burned 4 weeks.
+
+    Weakest link: adoption. If only 1-2 users enable shadow mode, signal
+    is too weak to drive confident next decision.
+  scope: release + observability
+  kind: process
+  layer: invalid
+  r_eff: null
+  evidence:
+  - id: defer-instrument-before-optimize
+    type: external
+    content: 'Standard ops principle: do not optimize without data. RAN-353 was specifically designed to enable this — would_decide field exists for shadow-mode comparison.'
+    verdict: pass
+    valid_until: null
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - methodology
+    congruence_level: 2
+    reliability: 0.7
+    refine_kind: null
+  - id: defer-adoption-risk
+    type: internal
+    content: secguard is a niche tool; user base is small. Without active outreach, shadow-mode adoption may be 0-2 users within 4 weeks, insufficient for statistical signal.
+    verdict: warn
+    valid_until: null
+    carrier_ref: null
+    formality: 2
+    claim_scope:
+    - adoption
+    congruence_level: 1
+    reliability: 0.5
+    refine_kind: null
+  - id: 20260505-internal-defer-collect-real-signal
+    type: internal
+    content: 'FATAL FLAW (challenge probe #3): we have no telemetry collection mechanism. RAN-353''s JSONL writes to ~/.secguard/telemetry.jsonl on the user''s machine — never uploaded. To make ''defer-and-instrument'' viable we''d first need to build a privacy-respecting uploader, which is a separate multi-week feature. The whole hypothesis presupposes infrastructure that does not exist.'
+    verdict: fail
+    valid_until: 2026-08-03T20:18:59.476680+00:00
+    carrier_ref: null
+    formality: 5
+    claim_scope:
+    - feasibility
+    congruence_level: null
+    reliability: 0.95
+    refine_kind: null
+  depends_on: []
+  rationale: null
+  spec_ref: null
+  prompt: null
+  next_move: null
+decision: null
+note_rationale: null
+expires_at: null
+auto_noted: false

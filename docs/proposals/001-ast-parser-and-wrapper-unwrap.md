@@ -1,9 +1,10 @@
 # Proposal 001: AST parsing + wrapper unwrap (structural FN/FP fix)
 
-**Status:** Draft — pending S5D decision on parser choice
+**Status:** Deferred — see [decision.next-on-bash-guard-parity__20260505](../../.s5d/packages/decision.next-on-bash-guard-parity__20260505.s5d.yaml). Parser-choice S5D blocked behind a working spike; RAN-355 will not land until rule-family expansion completes.
 **Authors:** @random1st (with tribunal input from Codex + Gemini, 2026-05-04)
 **Blocks:** RAN-353 (fixtures + shadow mode), RAN-354 (rm operand parsing)
-**Linear ticket:** not created (workspace limit) — track via this doc until promoted
+**Linear ticket:** RAN-355 (queued behind rule-family expansion)
+**Decision rationale:** Coverage math (40 missing rule fixtures vs 12 wrapper fixtures) plus parser-availability risk in the Rust ecosystem (no maintained bash-extension-aware library) make AST a worse next chunk than rule-family expansion. Wrapper FN stays conservatively covered by the substring fallback in `heuristic.rs` (asks on any `rm -rf` substring, no FN). Revisit when rule-family work hits an operand-parsing wall or when the fixture baseline plateaus.
 
 ## Problem
 

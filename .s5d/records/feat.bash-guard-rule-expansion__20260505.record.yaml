@@ -1,0 +1,17 @@
+spec_ref: feat.bash-guard-rule-expansion__20260505.s5d.yaml
+spec_sha256: sha256:d0e3f4d56263bf3ea4388b3812847006dfb017e01a5f7c52756ea5490ea60728
+status: proposed
+sync_status: unknown
+status_history:
+- status: proposed
+  timestamp: 2026-05-05T20:19:17.488648+00:00
+active_phase: null
+phase_history: []
+phase_runs: []
+approvals: []
+preview: null
+reflection: null
+gate_results: []
+decision: null
+verified_by: null
+drift_tolerance: null

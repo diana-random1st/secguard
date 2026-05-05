@@ -1,0 +1,223 @@
+s5d: '1.0'
+id: feat.bash-guard-rule-expansion
+version: 1.0.0
+product: secguard
+tier: standard
+allow_update: true
+meta:
+  title: bash-guard rule-family expansion (RAN-355 substitute, AST-free)
+  authors: [random1st]
+  date: 2026-05-05
+  tickets: []
+  adrs: []
+  renames: []
+context: |
+  ## Problem
+
+  After RAN-353 (798130b) + RAN-354 (3aa08c2), bash-guard fixture baseline
+  is 98/155 (63.2%). Of the 57 failures, ~40 are missing rule families, ~12
+  are wrapper-FN cases, ~10 are substring FPs. This feature closes the
+  rule-family bucket via heuristic.rs extensions. Wrapper FN stays
+  conservatively covered by the existing substring fallback (asks on any
+  `rm -rf`), which is OK because the FN class becomes Destructive-by-FP,
+  not Safe-by-FN.
+
+  ## Goal
+
+  Bring fixture baseline from 98/155 → 130+/155 (84%+) by adding 8 rule
+  families to heuristic.rs and tightening the substring fallback to skip
+  content inside `git commit -m`-style quoted args.
+
+  Concrete rules to add (one PR per family or batched 2-3):
+    1. Supabase ORM migrations: alembic, prisma migrate deploy, drizzle-kit
+       push, knex migrate:latest, goose up
+    2. Terraform / OpenTofu: apply, destroy
+    3. Redis destructive: FLUSHALL, FLUSHDB, SHUTDOWN, MIGRATE
+    4. Mongo destructive: db.dropDatabase(), db.X.drop(), deleteMany({})
+    5. ES/OpenSearch: HTTP DELETE + _delete_by_query mutations
+    6. Extra cloud CLIs: gsutil rm, oci compute terminate, ibmcloud cluster
+       rm, doctl droplet/databases delete, linode-cli volume/linodes delete
+    7. PaaS volumes/destroy: fly volumes destroy, railway down, railway
+       service/volume delete
+    8. Git history rewrite: filter-branch, filter-repo, BFG, push +refspec,
+       push -d origin <ref>
+    9. Substring-fallback tightening: skip `rm -rf` inside `git commit -m`
+       quoted args and similar known-safe quoted contexts.
+
+  ## Privacy
+  Classification: Internal — telemetry stays local, no upstream upload.
+
+  ## Decision provenance
+  See `.s5d/packages/decision.next-on-bash-guard-parity__20260505.s5d.yaml`
+  for the full rationale (winner: rule-family-expansion-first;
+  ast-and-wrapper-unwrap deferred to RAN-355).
+workflow:
+  mode: plan
+  target_architecture:
+    summary: Describe the steady-state design this change should reach
+    invariants: []
+  delivery_strategy:
+    summary: Describe how this change moves current code toward the target architecture
+    rationale: null
+  resources: null
+  role_map:
+    verifier: reviewer
+    reviewer: reviewer
+    implementer: coder
+    owner: human
+  review_policy:
+    cross_model_required: false
+    required_on: []
+  structure_outline: null
+  execution_mode:
+    engine: manual
+    max_iterations: null
+    stop_conditions:
+    - Phase acceptance reached
+    - Approved scope exhausted
+    - New decision required
+  phases:
+  - id: prototype
+    title: Prototype
+    scope: Reduce unknowns before committed implementation
+    roles:
+    - owner
+    - implementer
+    acceptance:
+    - Critical feasibility questions answered
+    - Telemetry approach identified
+    rollback:
+    - Discard spike output if assumptions fail
+  - id: build
+    title: Build
+    scope: Implement approved scope and pass local gates
+    roles:
+    - implementer
+    - reviewer
+    acceptance:
+    - Declared gates pass
+    - Change matches approved scope
+    rollback:
+    - Revert or reconcile if gates or review fail
+  - id: measure
+    title: Measure
+    scope: Collect telemetry and close the loop with an explicit verdict
+    roles:
+    - owner
+    - verifier
+    acceptance:
+    - Telemetry collected against success criteria
+    - Outcome verdict recorded
+    rollback:
+    - Iterate or kill if evidence stays weak
+artifacts:
+  products:
+  - id: secguard
+    name: secguard
+    organization: null
+  domains:
+  - id: guard
+    name: Destructive command guard
+    product: secguard
+    classification: core
+    description: Classifies shell commands as Safe or Destructive before execution
+  capabilities:
+  - id: heuristic-classification
+    domain: guard
+    name: Heuristic rule-based classification
+    description: Regex/token-level detection of destructive commands across major CLIs and shell idioms
+  - id: rule-taxonomy
+    domain: guard
+    name: Machine-readable rule taxonomy
+    description: RuleId enum mapping each detection to a stable code (e.g. infra.terraform_mutation)
+  entities: []
+  features:
+  - id: feat.bash-guard-rule-expansion
+    product: secguard
+    name: bash-guard-rule-expansion
+    description: Add 8 rule families and tighten substring fallback to close ~40 fixtures
+  use_cases:
+  - id: classify-orm-migration
+    feature: feat.bash-guard-rule-expansion
+    capability: heuristic-classification
+    name: Flag ORM migration commands as destructive
+  - id: classify-iac-mutation
+    feature: feat.bash-guard-rule-expansion
+    capability: heuristic-classification
+    name: Flag Terraform/OpenTofu apply/destroy as destructive
+  - id: classify-db-flush
+    feature: feat.bash-guard-rule-expansion
+    capability: heuristic-classification
+    name: Flag Redis FLUSHALL / Mongo dropDatabase as destructive
+  systems:
+  - id: secguard-runtime
+    product: secguard
+    name: secguard runtime
+  containers:
+  - id: secguard-guard-crate
+    system: secguard-runtime
+    name: secguard-guard crate
+    description: Rust crate that owns the destructive-command classification phases
+  components:
+  - id: heuristic-rs
+    feature: feat.bash-guard-rule-expansion
+    domain: guard
+    capability: heuristic-classification
+    container: secguard-guard-crate
+    name: heuristic.rs rule dispatcher
+    paths:
+    - crates/secguard-guard/src/heuristic.rs
+  - id: rule-id-rs
+    feature: feat.bash-guard-rule-expansion
+    domain: guard
+    capability: rule-taxonomy
+    container: secguard-guard-crate
+    name: RuleId enum
+    paths:
+    - crates/secguard-guard/src/rule_id.rs
+  - id: rm-rs
+    feature: feat.bash-guard-rule-expansion
+    domain: guard
+    capability: heuristic-classification
+    container: secguard-guard-crate
+    name: rm-family operand classifier
+    paths:
+    - crates/secguard-guard/src/rm.rs
+  - id: fixture-runner
+    feature: feat.bash-guard-rule-expansion
+    domain: guard
+    capability: heuristic-classification
+    container: secguard-guard-crate
+    name: bash-guard fixture replay test
+    paths:
+    - crates/secguard-guard/tests/fixture_runner.rs
+  roles: []
+  concerns: []
+  metrics: []
+  supersystems: []
+  transports: []
+links:
+  feature_to_domain: []
+  use_case_to_capability: []
+  use_case_to_entity: []
+  component_to_capability: []
+  component_to_entity: []
+  container_to_capability: []
+  concern_to_metric: []
+  component_to_container: []
+  edges: []
+  depends_on: []
+  entity_relations: []
+  capability_to_entity: []
+  capability_to_concern: []
+contracts: []
+gates:
+- kind: schema
+- kind: graph
+roc: null
+problem: null
+hypotheses: []
+decision: null
+note_rationale: null
+expires_at: null
+auto_noted: false

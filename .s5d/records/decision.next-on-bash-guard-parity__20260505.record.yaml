@@ -1,0 +1,41 @@
+spec_ref: decision.next-on-bash-guard-parity__20260505.s5d.yaml
+spec_sha256: sha256:afac3f907fc427849656f17791f809779f152c0a666379b469e426a047b2f314
+status: proposed
+sync_status: unknown
+status_history:
+- status: proposed
+  timestamp: 2026-05-05T20:15:03.884752+00:00
+active_phase: null
+phase_history: []
+phase_runs: []
+approvals: []
+preview: null
+reflection: null
+gate_results: []
+decision:
+  title: Ship rule-family expansion next; defer AST/wrapper to RAN-355
+  winner_id: rule-family-expansion-first
+  rejected_ids: []
+  context: Fixture data after RAN-353/354 shows ~40 fixtures fail because of missing rule families vs ~12 fixtures fail because of wrapper FN. Rule-family work is mechanical (~half-day each, regex extension); AST work needs parser S5D + spike + 2-week implementation, gains 3x less coverage.
+  decision: 'For the next 2-3 weeks, expand rule families: supabase ORM migrations, terraform/OpenTofu, redis FLUSH/SHUTDOWN, mongo destructive, ES/OpenSearch DELETE, gsutil rm, OCI/IBM/doctl CLIs, git filter-branch/+refspec, plus tighten substring fallback to skip git-commit-message content. Parser S5D + AST + wrapper unwrap stays queued in proposal 001 as RAN-355, blocked behind a parser-choice spike before any code commit.'
+  rationale: 'Three reasons: (1) coverage math — 40/12 = 3x more closures per unit work. (2) Risk asymmetry — regex rules are bounded; parser commit is novel territory in Rust ecosystem with no clean choice. (3) Wrapper FN class is already conservatively covered by substring fallback (asks on any rm-rf substring), so deferring B does not regress safety, only correctness on FP edge cases. Defer hypothesis (D) failed challenge probe #3: no telemetry-collection mechanism exists, so ''instrument before optimize'' presupposes infrastructure we do not have.'
+  consequences: 'Wrapper FN class stays open until RAN-355: agents emitting bash -c ''rm -rf X'' caught by substring fallback (conservative ask, no FN). Bucket-FP fixtures (10) require span classification for clean fix; partial fix via tighter substring exclusion possible. Parser-decision S5D queued; will trigger when this chunk completes or when fixture-coverage hits a wall the regex approach can''t pass.'
+  decided_at: 2026-05-05T20:19:51.729001+00:00
+  confirmed_by: random1st
+  expires_at: 2026-08-03
+  do_list: []
+  dont_list: []
+  challenge:
+    mode: standard
+    passed: true
+    summary: '5-probe challenge run: (1) wrapper bypass open — covered by conservative substring fallback (asks, no FN); (2) operand-parsing wall on mongo JSON — start with simple keyword rules, defer mongo to AST phase; (3) fixtures != threats — bash-guard is best public corpus we have; (4) AST-first as architectural correctness — agreed but compatible with A-then-B sequencing; (5) defer-and-instrument — telemetry collection infrastructure does not exist, fatal flaw in D, drop.'
+    checks: []
+  decision_subject: null
+  decision_subject_granularity: null
+  evaluative_surface: null
+  belief_state: null
+  outcome_model: null
+  pareto_set: []
+  choice_rule: null
+verified_by: null
+drift_tolerance: null
