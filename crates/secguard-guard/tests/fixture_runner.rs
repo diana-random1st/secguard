@@ -127,7 +127,16 @@ fn fixture_baseline_matches_known_invariants() {
         let stats = by_rule.entry(fx.expect.rule.clone()).or_default();
         stats.total += 1;
 
-        let actual = our_decision(&fx.input.tool_input.command);
+        // Match the runtime behaviour of `secguard hook guard`: only Bash
+        // (and shell-shaped tool names) feed into the classifier. A
+        // non-Bash tool (`Edit`, `Write`, MCP, etc.) reaches us only as
+        // structured tool input, never as a raw command, so the guard
+        // would not classify it. Treat as Safe for fixture parity.
+        let actual = if fx.input.tool_name == "Bash" {
+            our_decision(&fx.input.tool_input.command)
+        } else {
+            "allow"
+        };
         let expected: &str = fx.expect.decision.as_str();
 
         if actual == expected {
@@ -193,10 +202,16 @@ fn fixture_baseline_matches_known_invariants() {
     // baseline. Update this number in the same commit that intentionally
     // lowers it. Baseline history (155 fixtures total):
     //   2026-05-05  RAN-353 + RAN-354                            97-98 / 155
-    //   2026-05-06  rule-family expansion (terraform/redis/...)  138 / 155
-    // Floor sits 3 below the latest measurement to absorb noise without
-    // permitting silent rule-coverage regressions.
-    const BASELINE_MATCHED_FLOOR: usize = 135;
+    //   2026-05-06  rule-family expansion batches 1-4            138 / 155
+    //   2026-05-06  rule-family expansion batch 5 (helm/kubectl/
+    //               docker push/gsutil/netlify/git checkout/
+    //               graphql + bash -c re-parse + non-Bash skip)  149 / 155
+    // The remaining 6 mismatches all require AST/cwd/wrapper-unwrap
+    // (RAN-355) or pipe-to-shell literal re-parse: cwd_is_home_rm_dot,
+    // gcloud_compute_ssh_destructive, pipe_into_bash, rm_glob_in_cwd,
+    // rm_rf_tmp_subdir, subshell_rm_safe.
+    // Floor sits 3 below the latest measurement to absorb noise.
+    const BASELINE_MATCHED_FLOOR: usize = 146;
     assert!(
         matched >= BASELINE_MATCHED_FLOOR,
         "match rate regressed: matched={matched} < floor={BASELINE_MATCHED_FLOOR}. \

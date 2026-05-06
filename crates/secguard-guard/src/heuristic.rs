@@ -6,14 +6,13 @@ use crate::rule_id::RuleId;
 pub type RuleHit = (RuleId, String);
 
 pub fn check_destructive(cmd: &str, config: &GuardConfig) -> Option<RuleHit> {
-    if cmd.contains("git checkout .")
-        || cmd.contains("git checkout -- .")
-        || cmd.contains("git checkout -f")
-    {
-        return Some((
-            RuleId::GitCheckoutPathspec,
-            "git checkout (discards uncommitted changes)".into(),
-        ));
+    // `git checkout .`, `git checkout -- .`, `git checkout -f`, plus the
+    // file-targeted form `git checkout -- <pathspec>` which discards
+    // uncommitted changes to that file. Switch-branch forms (`git
+    // checkout <branch>`, `git checkout -b new`, `git checkout origin/x`)
+    // stay safe.
+    if let Some(reason) = check_git_checkout(cmd) {
+        return Some(reason);
     }
     // `git clean` is destructive only with `-f`/`-d`/`-x` AND no dry-run
     // shortcut. `git clean -fdn` is a dry-run despite containing -f, so
@@ -235,10 +234,400 @@ pub fn check_destructive(cmd: &str, config: &GuardConfig) -> Option<RuleHit> {
         return Some(hit);
     }
 
+    if let Some(hit) = check_helm_mutation(cmd) {
+        return Some(hit);
+    }
+
+    if let Some(hit) = check_kubectl_destructive(cmd) {
+        return Some(hit);
+    }
+
+    if let Some(hit) = check_docker_push(cmd) {
+        return Some(hit);
+    }
+
+    if let Some(hit) = check_gsutil_mutation(cmd) {
+        return Some(hit);
+    }
+
+    if let Some(hit) = check_netlify_sites_delete(cmd) {
+        return Some(hit);
+    }
+
+    if let Some(hit) = check_graphql_mutation(cmd) {
+        return Some(hit);
+    }
+
     if let Some(hit) = check_saas_cli_destructive(&cmd_lower) {
         return Some(hit);
     }
 
+    None
+}
+
+/// `helm install/uninstall/upgrade/rollback` mutate cluster state. The
+/// generic SAAS-CLI sweep doesn't cover `install` / `upgrade` / `rollback`
+/// since they're not in DESTRUCTIVE_SUBS; add the explicit form.
+fn check_helm_mutation(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    // helm global flags that consume a separate value token. Without this
+    // list, `helm -n prod upgrade ...` parses with `prod` as the first
+    // positional and the upgrade subcommand is missed.
+    const HELM_FLAG_VALS: &[&str] = &[
+        "-n",
+        "--namespace",
+        "--kubeconfig",
+        "--kube-context",
+        "--registry-config",
+        "--repository-cache",
+        "--repository-config",
+        "--burst-limit",
+        "--qps",
+    ];
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "helm" {
+            continue;
+        }
+        let positional = positional_after_flags(iter, HELM_FLAG_VALS);
+        if let Some(sub) = positional.first() {
+            if matches!(
+                *sub,
+                "install" | "upgrade" | "uninstall" | "delete" | "rollback"
+            ) {
+                return Some((
+                    RuleId::HelmMutation,
+                    format!("helm {sub} (cluster mutation)"),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Strip flags AND their values out of the iterator and return the
+/// remaining positional arguments. Pairs `-n prod` / `--namespace prod`
+/// are treated as a single flag-value group; long-form `--name=val` is
+/// a single token and is dropped without consuming a separate value.
+/// Without this, `kubectl -n prod apply` would treat `prod` as the
+/// first positional and miss the `apply` subcommand.
+fn positional_after_flags<'a, I>(iter: I, flags_with_val: &[&str]) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut out = Vec::new();
+    let mut peek = iter.into_iter().peekable();
+    while let Some(t) = peek.next() {
+        let s = t.as_str();
+        if !s.starts_with('-') {
+            out.push(s);
+            continue;
+        }
+        if s.contains('=') {
+            continue;
+        }
+        if flags_with_val.contains(&s) {
+            peek.next();
+        }
+    }
+    out
+}
+
+/// `kubectl apply` / `kubectl delete` / `kubectl patch` / `kubectl rollout
+/// restart` / `kubectl scale` / `kubectl drain` / `kubectl cordon`. The
+/// policy allowlist explicitly carves out read-only verbs (get/describe/
+/// logs/etc.) before this check fires, so we know we're in mutation
+/// territory.
+fn check_kubectl_destructive(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    const KUBECTL_FLAG_VALS: &[&str] = &[
+        "-n",
+        "--namespace",
+        "--context",
+        "--cluster",
+        "--user",
+        "--kubeconfig",
+        "--token",
+        "--server",
+        "--certificate-authority",
+        "--client-certificate",
+        "--client-key",
+        "--as",
+        "--as-group",
+        "-o",
+        "--output",
+    ];
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "kubectl" {
+            continue;
+        }
+        let positional = positional_after_flags(iter, KUBECTL_FLAG_VALS);
+        let sub1 = positional.first().copied();
+        let sub2 = positional.get(1).copied();
+        let dest = matches!(
+            sub1,
+            Some(
+                "apply"
+                    | "delete"
+                    | "patch"
+                    | "replace"
+                    | "edit"
+                    | "drain"
+                    | "cordon"
+                    | "uncordon"
+                    | "scale"
+                    | "annotate"
+                    | "label"
+                    | "create"
+                    | "set"
+                    | "autoscale"
+                    | "taint"
+                    | "expose"
+                    | "run"
+            )
+        ) || (sub1 == Some("rollout")
+            && matches!(sub2, Some("restart" | "undo" | "pause")));
+        if dest {
+            return Some((
+                RuleId::KubectlMutation,
+                format!("kubectl {} (cluster mutation)", sub1.unwrap_or("?")),
+            ));
+        }
+    }
+    None
+}
+
+/// `docker push <ref>` publishes a container image to the registry. Once
+/// pushed, the image is visible to anyone who can pull from that registry.
+/// `docker push --help` and similar non-positional invocations stay safe.
+fn check_docker_push(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    const DOCKER_FLAG_VALS: &[&str] = &[
+        "-H",
+        "--host",
+        "--context",
+        "--config",
+        "--log-level",
+        "--tls-cacert",
+        "--tls-cert",
+        "--tls-key",
+    ];
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "docker" {
+            continue;
+        }
+        let positional = positional_after_flags(iter, DOCKER_FLAG_VALS);
+        if positional.first().copied() == Some("push") && positional.len() >= 2 {
+            return Some((
+                RuleId::DockerPush,
+                "docker push (publishes image to registry)".into(),
+            ));
+        }
+    }
+    None
+}
+
+/// `gsutil rm` / `gsutil rsync -d` mutate Google Cloud Storage buckets.
+/// `gsutil ls`/`cat`/`stat` stay safe.
+fn check_gsutil_mutation(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    const GSUTIL_FLAG_VALS: &[&str] = &["-h", "-D", "-DD", "-o", "-i", "-u", "--help", "--version"];
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "gsutil" {
+            continue;
+        }
+        let rest: Vec<String> = iter.cloned().collect();
+        let positional = positional_after_flags(rest.iter(), GSUTIL_FLAG_VALS);
+        if positional.first().copied() == Some("rm") {
+            return Some((
+                RuleId::GsutilMutation,
+                "gsutil rm (deletes GCS object)".into(),
+            ));
+        }
+        if positional.first().copied() == Some("rsync") && rest.iter().any(|t| t == "-d") {
+            return Some((
+                RuleId::GsutilMutation,
+                "gsutil rsync -d (mirror with delete)".into(),
+            ));
+        }
+        if matches!(positional.first().copied(), Some("rb" | "mv")) {
+            return Some((
+                RuleId::GsutilMutation,
+                format!("gsutil {} (bucket mutation)", positional[0]),
+            ));
+        }
+    }
+    None
+}
+
+/// `netlify sites:delete <id> --force` — the colon-suffix form is not
+/// covered by the generic SAAS-CLI sweep (DESTRUCTIVE_SUBS includes
+/// `:destroy` but not `:delete`).
+fn check_netlify_sites_delete(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "netlify" {
+            continue;
+        }
+        if iter.any(|t| {
+            let s = t.as_str();
+            s.ends_with(":delete") || s.ends_with(":destroy") || s.ends_with(":remove")
+        }) {
+            return Some((RuleId::SaasDestroy, "netlify *:delete / *:destroy".into()));
+        }
+    }
+    None
+}
+
+/// Detect GraphQL `mutation { ... delete ... }` payloads sent to remote
+/// HTTP endpoints. Hard-gates on `curl` AND a graphql endpoint marker
+/// to avoid firing on unrelated commands that mention "mutation"
+/// elsewhere. Word-boundary check on `mutation` to ensure it's a
+/// GraphQL operation keyword and not a substring of a longer word.
+/// Localhost is carved out.
+fn check_graphql_mutation(cmd: &str) -> Option<RuleHit> {
+    if !cmd.contains("curl") {
+        return None;
+    }
+    if !cmd.contains("graphql") && !cmd.contains("/graphql") {
+        return None;
+    }
+    let lower = cmd.to_ascii_lowercase();
+    let is_localhost = lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("[::1]")
+        || lower.contains("0.0.0.0");
+    if is_localhost {
+        return None;
+    }
+    let posty = cmd.contains("-X POST")
+        || cmd.contains("-XPOST")
+        || cmd.contains("--request POST")
+        || cmd.contains(" -d ")
+        || cmd.contains(" --data ");
+    if !posty {
+        return None;
+    }
+    if !contains_graphql_mutation_keyword(&lower) {
+        return None;
+    }
+    let body_lower = lower.as_str();
+    if body_lower.contains("delete")
+        || body_lower.contains("destroy")
+        || body_lower.contains("remove")
+        || body_lower.contains("drop")
+        || body_lower.contains("purge")
+        || body_lower.contains("terminate")
+    {
+        return Some((
+            RuleId::GraphqlMutation,
+            "GraphQL mutation with delete/destroy in body".into(),
+        ));
+    }
+    None
+}
+
+/// Word-boundary match for `mutation` as a GraphQL operation keyword.
+/// Allows `mutation {...}`, `mutation foo {...}`, `mutation(...) {...}`.
+/// Rejects unrelated names like `getMutation`, `Mutation42`, `permutation`.
+fn contains_graphql_mutation_keyword(lower: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(pos) = lower[search_from..].find("mutation") {
+        let abs = search_from + pos;
+        let before_ok = abs == 0
+            || !lower
+                .as_bytes()
+                .get(abs - 1)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        let after_idx = abs + "mutation".len();
+        let after_ok = lower
+            .as_bytes()
+            .get(after_idx)
+            .map(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = abs + 1;
+    }
+    false
+}
+
+/// `git checkout` is destructive when it touches the worktree:
+///   git checkout .                    — discards uncommitted changes
+///   git checkout -- .                 — same with explicit pathspec
+///   git checkout -- <file>            — discards changes to <file>
+///   git checkout -f                   — force overwrite worktree
+/// Switch-branch forms are safe:
+///   git checkout <branch>
+///   git checkout -b new
+///   git checkout origin/x
+fn check_git_checkout(cmd: &str) -> Option<RuleHit> {
+    let tokens = match shell_words::split(cmd) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    for segment in split_segments(&tokens) {
+        let mut iter = segment.iter().skip_while(|t| is_var_assign(t));
+        let Some(head) = iter.next() else { continue };
+        if head.as_str() != "git" {
+            continue;
+        }
+        if iter.next().map(String::as_str) != Some("checkout") {
+            continue;
+        }
+        let rest: Vec<&String> = iter.collect();
+        if rest
+            .iter()
+            .any(|t| t.as_str() == "-f" || t.as_str() == "--force")
+        {
+            return Some((
+                RuleId::GitCheckoutPathspec,
+                "git checkout -f (force overwrites worktree)".into(),
+            ));
+        }
+        // `git checkout --` separator: everything after is a pathspec list.
+        // Any pathspec form (`.`, `<file>`) is destructive.
+        if let Some(sep_idx) = rest.iter().position(|t| t.as_str() == "--") {
+            if rest.get(sep_idx + 1).is_some() {
+                return Some((
+                    RuleId::GitCheckoutPathspec,
+                    "git checkout -- <pathspec> (discards uncommitted changes)".into(),
+                ));
+            }
+        }
+        // `git checkout .` — unambiguous pathspec, no `--` needed.
+        if rest.iter().any(|t| t.as_str() == ".") {
+            return Some((
+                RuleId::GitCheckoutPathspec,
+                "git checkout . (discards uncommitted changes)".into(),
+            ));
+        }
+    }
     None
 }
 
@@ -608,8 +997,15 @@ fn check_git_clean(cmd: &str) -> Option<RuleHit> {
 /// a wrapper, JOIN the remaining tokens with single spaces and substring-
 /// match `rm -rf` / `rm -fr` / `rm -r`. Joining is what catches both
 /// `chroot /mnt rm -rf /etc` (separate tokens) and `bash -c "rm -rf /"`
-/// (single quoted token). Full unwrap + re-parse is RAN-355.
+/// (single quoted token).
+///
+/// Special case for shell-`-c` wrappers: when the head is `bash`/`sh`/
+/// `zsh`/`ksh`/`dash` and the segment carries a `-c <BODY>` (literal),
+/// re-parse the body via `rm::check_rm` so that safe-path operands are
+/// honoured (`sh -c 'rm -rf /tmp/cache'` stays Safe). Full unwrap +
+/// re-parse for non-shell wrappers is RAN-355.
 fn check_wrapped_rm(cmd: &str) -> Option<RuleHit> {
+    const SHELL_HEADS: &[&str] = &["bash", "sh", "zsh", "ksh", "dash"];
     const WRAPPER_HEADS: &[&str] = &[
         "sudo", "doas", "env", "command", "builtin", "exec", "bash", "sh", "zsh", "ksh", "dash",
         "eval", "xargs", "parallel", "watch", "find", "ssh", "chroot", "timeout", "nohup", "time",
@@ -625,7 +1021,35 @@ fn check_wrapped_rm(cmd: &str) -> Option<RuleHit> {
         if !WRAPPER_HEADS.contains(&head.as_str()) {
             continue;
         }
-        let tail: Vec<&str> = iter.map(String::as_str).collect();
+        let tail: Vec<String> = iter.cloned().collect();
+
+        // Shell `-c '<BODY>'` form — re-parse the body so safe paths
+        // inside the body are respected. Avoids the FP class
+        // `sh -c 'rm -rf /tmp/cache'` while keeping
+        // `sh -c 'rm -rf /etc'` destructive.
+        if SHELL_HEADS.contains(&head.as_str()) {
+            for (i, t) in tail.iter().enumerate() {
+                let body: Option<&str> = if t == "-c" {
+                    tail.get(i + 1).map(String::as_str)
+                } else if let Some(rest) = t.strip_prefix("-c") {
+                    if !rest.is_empty() && !rest.starts_with('-') {
+                        Some(rest)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(body) = body {
+                    match crate::rm::check_rm(body, &GuardConfig::default()) {
+                        crate::rm::RmCheck::Destructive(hit) => return Some(hit),
+                        crate::rm::RmCheck::Safe => return None,
+                        crate::rm::RmCheck::NotFound => {}
+                    }
+                }
+            }
+        }
+
         let joined = tail.join(" ");
         if joined.contains("rm -rf") || joined.contains("rm -fr") {
             return Some((
@@ -1581,6 +2005,259 @@ mod tests {
         // (which would hit on " reset" in DESTRUCTIVE_SUBS if reordered).
         let cfg = GuardConfig::default();
         let result = check_destructive("heroku pg:reset DATABASE_URL --app myapp", &cfg);
+        assert!(result.is_some());
+    }
+
+    // ── Batch 5: helm / kubectl / docker push / gsutil / netlify ────────
+
+    #[test]
+    fn detect_helm_install() {
+        assert_destructive("helm install my-release charts/app", RuleId::HelmMutation);
+    }
+
+    #[test]
+    fn detect_helm_uninstall() {
+        assert_destructive("helm uninstall my-release", RuleId::HelmMutation);
+    }
+
+    #[test]
+    fn detect_helm_upgrade() {
+        assert_destructive("helm upgrade my-release charts/app", RuleId::HelmMutation);
+    }
+
+    #[test]
+    fn allow_helm_list() {
+        assert_safe("helm list");
+    }
+
+    #[test]
+    fn detect_kubectl_apply() {
+        assert_destructive("kubectl apply -f manifest.yaml", RuleId::KubectlMutation);
+    }
+
+    #[test]
+    fn detect_kubectl_rollout_restart() {
+        assert_destructive(
+            "kubectl rollout restart deploy/api",
+            RuleId::KubectlMutation,
+        );
+    }
+
+    #[test]
+    fn detect_kubectl_delete() {
+        assert_destructive("kubectl delete pod foo", RuleId::KubectlMutation);
+    }
+
+    #[test]
+    fn detect_kubectl_patch() {
+        assert_destructive(
+            "kubectl patch deployment api -p '{\"spec\":{}}'",
+            RuleId::KubectlMutation,
+        );
+    }
+
+    #[test]
+    fn allow_kubectl_get() {
+        // policy.rs catches this before heuristic, but verify direct
+        // call doesn't fire either.
+        let cfg = GuardConfig::default();
+        assert!(check_destructive("kubectl get pods", &cfg).is_none());
+    }
+
+    #[test]
+    fn detect_docker_push() {
+        assert_destructive("docker push myreg.io/img:tag", RuleId::DockerPush);
+    }
+
+    #[test]
+    fn allow_docker_pull() {
+        assert_safe("docker pull alpine:latest");
+    }
+
+    #[test]
+    fn detect_gsutil_rm() {
+        assert_destructive("gsutil rm gs://my-bucket/file.txt", RuleId::GsutilMutation);
+    }
+
+    #[test]
+    fn detect_gsutil_rsync_delete() {
+        assert_destructive(
+            "gsutil rsync -d ./local gs://bucket",
+            RuleId::GsutilMutation,
+        );
+    }
+
+    #[test]
+    fn allow_gsutil_ls() {
+        assert_safe("gsutil ls gs://my-bucket");
+    }
+
+    #[test]
+    fn detect_netlify_sites_delete() {
+        assert_destructive("netlify sites:delete site-abc --force", RuleId::SaasDestroy);
+    }
+
+    #[test]
+    fn allow_netlify_status() {
+        assert_safe("netlify status");
+    }
+
+    // ── git checkout file/--/-f ─────────────────────────────────────────
+
+    #[test]
+    fn detect_git_checkout_file() {
+        assert_destructive("git checkout -- src/main.go", RuleId::GitCheckoutPathspec);
+    }
+
+    #[test]
+    fn detect_git_checkout_force() {
+        assert_destructive("git checkout -f", RuleId::GitCheckoutPathspec);
+    }
+
+    #[test]
+    fn detect_git_checkout_dot() {
+        assert_destructive("git checkout .", RuleId::GitCheckoutPathspec);
+    }
+
+    #[test]
+    fn allow_git_checkout_branch() {
+        assert_safe("git checkout main");
+        assert_safe("git checkout feature/new");
+        assert_safe("git checkout -b new-feature");
+    }
+
+    // ── GraphQL mutation ────────────────────────────────────────────────
+
+    #[test]
+    fn detect_curl_graphql_mutation_delete() {
+        assert_destructive(
+            "curl -X POST https://backboard.railway.com/graphql/v2 -d '{\"query\":\"mutation { volumeDelete(id: \\\"v1\\\") }\"}'",
+            RuleId::GraphqlMutation,
+        );
+    }
+
+    #[test]
+    fn allow_curl_graphql_query() {
+        // No "mutation" keyword → just a query, allow.
+        assert_safe(
+            "curl -X POST https://api.example.com/graphql -d '{\"query\":\"{ users { id } }\"}'",
+        );
+    }
+
+    // ── bash -c body re-parse ───────────────────────────────────────────
+
+    #[test]
+    fn allow_sh_dash_c_rm_in_safe_path() {
+        // The wrapper-substring fallback would FP here; the -c body re-
+        // parse via rm::check_rm classifies /tmp/cache as Safe.
+        assert_safe("sh -c 'rm -rf /tmp/cache'");
+        assert_safe("bash -c 'rm -rf node_modules'");
+    }
+
+    #[test]
+    fn detect_sh_dash_c_rm_in_etc() {
+        assert_destructive("sh -c 'rm -rf /etc/nginx'", RuleId::RmRf);
+        assert_destructive("bash -c 'rm -rf /etc'", RuleId::RmRf);
+    }
+
+    // ── Tribunal-3 fixes (Codex VERIFIED): global-flag arity ───────────
+
+    #[test]
+    fn detect_helm_with_global_namespace_flag() {
+        // `helm -n prod upgrade` — bare-flag form must consume the value
+        // token before recognising the subcommand.
+        assert_destructive(
+            "helm -n prod upgrade my-release charts/app",
+            RuleId::HelmMutation,
+        );
+        assert_destructive(
+            "helm --namespace prod uninstall my-release",
+            RuleId::HelmMutation,
+        );
+        assert_destructive(
+            "helm --namespace=prod uninstall my-release",
+            RuleId::HelmMutation,
+        );
+    }
+
+    #[test]
+    fn detect_kubectl_with_global_namespace_flag() {
+        assert_destructive(
+            "kubectl -n prod apply -f manifest.yaml",
+            RuleId::KubectlMutation,
+        );
+        assert_destructive(
+            "kubectl --context prod-cluster delete pod foo",
+            RuleId::KubectlMutation,
+        );
+        assert_destructive(
+            "kubectl --kubeconfig=/tmp/cfg patch deployment api -p '{}'",
+            RuleId::KubectlMutation,
+        );
+    }
+
+    #[test]
+    fn detect_kubectl_set_image() {
+        assert_destructive(
+            "kubectl set image deployment/api app=v2",
+            RuleId::KubectlMutation,
+        );
+    }
+
+    #[test]
+    fn detect_docker_with_host_flag() {
+        assert_destructive(
+            "docker -H tcp://prod:2376 push myreg/img:tag",
+            RuleId::DockerPush,
+        );
+        assert_destructive(
+            "docker --host=tcp://prod:2376 push myreg/img:tag",
+            RuleId::DockerPush,
+        );
+    }
+
+    #[test]
+    fn graphql_mutation_requires_curl() {
+        // `echo "mutation { delete }" -d body` has no curl — must NOT
+        // fire even though the substring `mutation` and `delete` appear.
+        let cfg = GuardConfig::default();
+        assert!(check_destructive("echo \"mutation { delete(id:1) }\" -d body", &cfg).is_none());
+    }
+
+    #[test]
+    fn graphql_mutation_requires_graphql_endpoint() {
+        // No `graphql` substring → no GraphQL fire even with curl + POST
+        // + mutation keyword. (HTTP DELETE detection covers other curl
+        // verbs separately.)
+        let cfg = GuardConfig::default();
+        assert!(check_destructive(
+            "curl -X POST https://api.example.com -d '{\"query\":\"mutation { delete }\"}'",
+            &cfg
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn graphql_mutation_word_boundary() {
+        // `getMutation` contains `mutation` as a substring but not as a
+        // word — must not trigger.
+        let cfg = GuardConfig::default();
+        assert!(check_destructive(
+            "curl -X POST https://api.example.com/graphql -d '{\"query\":\"query getMutation { delete }\"}'",
+            &cfg
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn graphql_mutation_named_operation_fires() {
+        // Named GraphQL mutation: `mutation FooDelete { ... }` — keyword
+        // is at a word boundary. Should fire.
+        let cfg = GuardConfig::default();
+        let result = check_destructive(
+            "curl -X POST https://api.example.com/graphql -d '{\"query\":\"mutation FooDelete { volumeDelete(id:1) }\"}'",
+            &cfg,
+        );
         assert!(result.is_some());
     }
 }

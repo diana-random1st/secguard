@@ -38,6 +38,11 @@ pub enum RuleId {
     MongoDestructive,
     OrmMigration,
     SupabaseDbMutation,
+    HelmMutation,
+    KubectlMutation,
+    DockerPush,
+    GsutilMutation,
+    GraphqlMutation,
     Brain,
 }
 
@@ -72,6 +77,11 @@ impl RuleId {
             RuleId::MongoDestructive => "infra.mongo_destructive",
             RuleId::OrmMigration => "supabase.orm_migration",
             RuleId::SupabaseDbMutation => "supabase.db_mutation",
+            RuleId::HelmMutation => "infra.helm_mutation",
+            RuleId::KubectlMutation => "infra.kubectl_destructive",
+            RuleId::DockerPush => "infra.docker_destructive",
+            RuleId::GsutilMutation => "infra.gsutil_mutation",
+            RuleId::GraphqlMutation => "infra.cloud_api_mutation",
             RuleId::Brain => "brain.classification",
         }
     }
