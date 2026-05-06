@@ -13,7 +13,6 @@
 //! This module owns the first three steps. Rules in [`crate::rules`]
 //! consume the resulting [`EffectiveCommand`] stream as pure predicates.
 
-use std::sync::OnceLock;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Where in the source a chunk of text actually executes vs. is data.
@@ -29,38 +28,34 @@ pub enum SpanKind {
     Data,
 }
 
-/// A wrapper that nests another command inside it. Used to attribute the
-/// "via_wrapper" chain and to disable local safe-paths when the inner
-/// command actually runs on a remote host or in a chroot.
+/// Tag describing the outermost wrapper a command was nested under.
+/// Rules barely look at the specific wrapper kind — the discriminating
+/// information (`remote`, `chrooted`) is already on `EffectiveCommand`
+/// directly. The 25-variant enum we used to carry was a port from
+/// bash-guard's taxonomy; six categories are enough to attribute the
+/// chain in telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wrapper {
+    /// `sudo`, `doas` — privilege escalation, no semantic effect on
+    /// classification beyond traceability.
     Sudo,
-    Doas,
-    Env,
-    Command,
-    Builtin,
-    Exec,
-    BashC,
-    ShC,
-    ZshC,
-    KshC,
-    DashC,
-    Eval,
-    Xargs,
-    Parallel,
-    Watch,
-    FindExec,
-    FindDelete,
+    /// `env`, `command`, `builtin`, `exec`, `timeout`, `nohup`, `time`,
+    /// `nice`, `ionice`, `setsid`, `flock`, `busybox` — pass-through
+    /// wrappers that don't change the inner command's meaning.
+    PassThrough,
+    /// `bash -c "..."`, `sh -c`, `zsh -c`, `ksh -c`, `dash -c`,
+    /// `eval` — bodies are re-parsed as bash.
+    Shell,
+    /// `xargs <cmd>`, `parallel`, `watch` — inner command runs with
+    /// argv extended by piped input (unknown at parse time).
+    StdinArgs,
+    /// `find ... -delete` (synthesized rm) and `find ... -exec cmd`.
+    Find,
+    /// `ssh host cmd` — inner command runs on a remote host. Marks
+    /// `EffectiveCommand.remote = true`.
     Ssh,
+    /// `chroot /path cmd` — marks `EffectiveCommand.chrooted = true`.
     Chroot,
-    Timeout,
-    Nohup,
-    Time,
-    Nice,
-    Ionice,
-    Setsid,
-    Flock,
-    Busybox,
 }
 
 /// One executable command after wrapper unwrapping. `argv[0]` is the
@@ -92,81 +87,59 @@ impl EffectiveCommand {
             &self.argv[1..]
         }
     }
-
-    pub fn via(&self, wrapper: Wrapper) -> bool {
-        self.wrappers.contains(&wrapper)
-    }
 }
 
-/// Outcome of a parse attempt. Asymmetric fail-open semantics live one
-/// layer up: callers that hit `ParseError` still need to decide whether
-/// the malformed input contained a destructive trigger keyword (=> ask)
-/// or not (=> allow).
+/// Result of a parse: the flat list of effective commands the source
+/// would execute, plus a `had_error` flag set when tree-sitter saw
+/// ERROR/MISSING nodes (or failed to produce a tree at all). Callers
+/// use the flag to drive the asymmetric fail-open decision in
+/// [`crate::lib::check_detailed`].
 #[derive(Debug)]
-pub enum ParseOutcome {
-    Ok(Vec<EffectiveCommand>),
-    /// Parser produced a tree but it contains ERROR/MISSING nodes
-    /// covering at least one byte of the source. The (possibly partial)
-    /// commands extracted before the first error are returned so the
-    /// caller can still inspect what was clearly executable.
-    Partial {
-        commands: Vec<EffectiveCommand>,
-        error_byte: usize,
-    },
-    /// Parser failed to produce a tree at all. Treat as "unknown
-    /// content" — no commands extracted.
-    Failed,
+pub struct ParseResult {
+    pub commands: Vec<EffectiveCommand>,
+    pub had_error: bool,
 }
 
-/// Parse a raw bash command and return the flat list of effective
-/// commands that would actually execute, with wrapper chains and cwd
-/// context resolved.
-pub fn parse(source: &str) -> ParseOutcome {
+/// Parse a raw bash command. Always returns a list of commands (possibly
+/// empty) and a flag indicating whether the parse hit any error nodes.
+pub fn parse(source: &str) -> ParseResult {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .is_err()
     {
-        return ParseOutcome::Failed;
+        return ParseResult {
+            commands: Vec::new(),
+            had_error: true,
+        };
     }
     let Some(tree) = parser.parse(source, None) else {
-        return ParseOutcome::Failed;
+        return ParseResult {
+            commands: Vec::new(),
+            had_error: true,
+        };
     };
 
     let bytes = source.as_bytes();
     let mut walker = Walker::new(bytes);
     walker.walk_program(tree.root_node());
 
-    if let Some(err_byte) = first_error_byte(&tree, bytes) {
-        return ParseOutcome::Partial {
-            commands: walker.commands,
-            error_byte: err_byte,
-        };
+    ParseResult {
+        commands: walker.commands,
+        had_error: tree_has_error(&tree),
     }
-    ParseOutcome::Ok(walker.commands)
 }
 
-/// Cached language handle so repeated `parse()` calls don't re-init.
-#[allow(dead_code)]
-fn lang() -> &'static tree_sitter::Language {
-    static L: OnceLock<tree_sitter::Language> = OnceLock::new();
-    L.get_or_init(|| tree_sitter_bash::LANGUAGE.into())
-}
-
-fn first_error_byte(tree: &Tree, bytes: &[u8]) -> Option<usize> {
-    fn walk(node: Node<'_>, bytes: &[u8]) -> Option<usize> {
+fn tree_has_error(tree: &Tree) -> bool {
+    fn walk(node: Node<'_>) -> bool {
         if node.is_error() || node.is_missing() {
-            return Some(node.start_byte().min(bytes.len()));
+            return true;
         }
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(b) = walk(child, bytes) {
-                return Some(b);
-            }
-        }
-        None
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        children.into_iter().any(walk)
     }
-    walk(tree.root_node(), bytes)
+    walk(tree.root_node())
 }
 
 struct Walker<'a> {
@@ -290,21 +263,15 @@ impl<'a> Walker<'a> {
                             continue;
                         }
                         let body = strip_outer_quotes(arg);
-                        if let ParseOutcome::Ok(inner)
-                        | ParseOutcome::Partial {
-                            commands: inner, ..
-                        } = parse(body)
-                        {
-                            for mut cmd in inner {
-                                let mut chain = wrappers.to_vec();
-                                chain.push(Wrapper::ShC);
-                                chain.extend(cmd.wrappers.into_iter());
-                                cmd.wrappers = chain;
-                                if cmd.cwd.is_none() {
-                                    cmd.cwd = self.cwd.clone();
-                                }
-                                self.commands.push(cmd);
+                        for mut cmd in parse(body).commands {
+                            let mut chain = wrappers.to_vec();
+                            chain.push(Wrapper::Shell);
+                            chain.extend(cmd.wrappers.into_iter());
+                            cmd.wrappers = chain;
+                            if cmd.cwd.is_none() {
+                                cmd.cwd = self.cwd.clone();
                             }
+                            self.commands.push(cmd);
                         }
                     }
                 }
@@ -468,12 +435,8 @@ impl<'a> Walker<'a> {
             acc_chrooted = acc_chrooted || c;
             if let Some(body) = body {
                 // Re-parse the literal `-c BODY` payload as fresh bash.
-                if let ParseOutcome::Ok(inner_cmds)
-                | ParseOutcome::Partial {
-                    commands: inner_cmds,
-                    ..
-                } = parse(&body)
-                {
+                let inner_cmds = parse(&body).commands;
+                if !inner_cmds.is_empty() {
                     for mut cmd in inner_cmds {
                         let mut full_chain = chain.clone();
                         full_chain.extend(cmd.wrappers.into_iter());
@@ -714,14 +677,14 @@ fn unwrap_wrapper(argv: &[String]) -> Option<(Wrapper, Vec<String>, bool, bool, 
                 .any(|t| t.starts_with('$') || t.contains("$(") || t.contains('`'));
             if dynamic {
                 return Some((
-                    Wrapper::Eval,
+                    Wrapper::Shell,
                     vec!["__eval_dynamic__".to_string(), body],
                     false,
                     false,
                     None,
                 ));
             }
-            Some((Wrapper::Eval, Vec::new(), false, false, Some(body)))
+            Some((Wrapper::Shell, Vec::new(), false, false, Some(body)))
         }
         "timeout" | "nohup" | "time" | "nice" | "ionice" | "setsid" | "flock" => {
             // Per-wrapper argful flag tables. Stops at first positional;
@@ -839,7 +802,7 @@ fn unwrap_wrapper(argv: &[String]) -> Option<(Wrapper, Vec<String>, bool, bool, 
                         break;
                     }
                 }
-                return Some((Wrapper::FindDelete, synth, false, false, None));
+                return Some((Wrapper::Find, synth, false, false, None));
             }
             if let Some(pos) = rest.iter().position(|t| t == "-exec" || t == "-execdir") {
                 let after = &rest[pos + 1..];
@@ -855,7 +818,7 @@ fn unwrap_wrapper(argv: &[String]) -> Option<(Wrapper, Vec<String>, bool, bool, 
                     .filter(|t| t != "{}" && !t.is_empty())
                     .collect();
                 if !cleaned.is_empty() {
-                    return Some((Wrapper::FindExec, cleaned, false, false, None));
+                    return Some((Wrapper::Find, cleaned, false, false, None));
                 }
             }
             None
@@ -864,7 +827,7 @@ fn unwrap_wrapper(argv: &[String]) -> Option<(Wrapper, Vec<String>, bool, bool, 
             // `busybox CMD args...` — drop the head and let the inner
             // command's classifier run.
             if argv.len() >= 2 {
-                Some((Wrapper::Busybox, argv[1..].to_vec(), false, false, None))
+                Some((Wrapper::PassThrough, argv[1..].to_vec(), false, false, None))
             } else {
                 None
             }
@@ -875,32 +838,16 @@ fn unwrap_wrapper(argv: &[String]) -> Option<(Wrapper, Vec<String>, bool, bool, 
 
 fn wrapper_for_head(head: &str) -> Wrapper {
     match head {
-        "sudo" => Wrapper::Sudo,
-        "doas" => Wrapper::Doas,
-        "env" => Wrapper::Env,
-        "command" => Wrapper::Command,
-        "builtin" => Wrapper::Builtin,
-        "exec" => Wrapper::Exec,
-        "bash" => Wrapper::BashC,
-        "sh" => Wrapper::ShC,
-        "zsh" => Wrapper::ZshC,
-        "ksh" => Wrapper::KshC,
-        "dash" => Wrapper::DashC,
-        "eval" => Wrapper::Eval,
-        "xargs" => Wrapper::Xargs,
-        "parallel" => Wrapper::Parallel,
-        "watch" => Wrapper::Watch,
+        "sudo" | "doas" => Wrapper::Sudo,
+        "bash" | "sh" | "zsh" | "ksh" | "dash" => Wrapper::Shell,
+        "eval" => Wrapper::Shell,
+        "xargs" | "parallel" | "watch" => Wrapper::StdinArgs,
         "ssh" => Wrapper::Ssh,
         "chroot" => Wrapper::Chroot,
-        "timeout" => Wrapper::Timeout,
-        "nohup" => Wrapper::Nohup,
-        "time" => Wrapper::Time,
-        "nice" => Wrapper::Nice,
-        "ionice" => Wrapper::Ionice,
-        "setsid" => Wrapper::Setsid,
-        "flock" => Wrapper::Flock,
-        "busybox" => Wrapper::Busybox,
-        _ => Wrapper::Sudo, // unreachable in practice
+        // env, command, builtin, exec, timeout, nohup, time, nice,
+        // ionice, setsid, flock, busybox — pass-through wrappers that
+        // don't change the inner command's classification semantics.
+        _ => Wrapper::PassThrough,
     }
 }
 
@@ -921,10 +868,7 @@ mod tests {
     use super::*;
 
     fn cmds(src: &str) -> Vec<EffectiveCommand> {
-        match parse(src) {
-            ParseOutcome::Ok(c) | ParseOutcome::Partial { commands: c, .. } => c,
-            ParseOutcome::Failed => Vec::new(),
-        }
+        parse(src).commands
     }
 
     #[test]
@@ -955,7 +899,7 @@ mod tests {
         let c = cmds("bash -c 'rm -rf /etc/nginx'");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].argv, vec!["rm", "-rf", "/etc/nginx"]);
-        assert!(c[0].wrappers.contains(&Wrapper::BashC));
+        assert!(c[0].wrappers.contains(&Wrapper::Shell));
     }
 
     #[test]
@@ -963,7 +907,7 @@ mod tests {
         let c = cmds("eval \"rm -rf /etc\"");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].argv, vec!["rm", "-rf", "/etc"]);
-        assert!(c[0].wrappers.contains(&Wrapper::Eval));
+        assert!(c[0].wrappers.contains(&Wrapper::Shell));
     }
 
     #[test]
@@ -972,8 +916,8 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].argv, vec!["rm", "-rf", "/etc"]);
         let w = &c[0].wrappers;
-        assert!(w.contains(&Wrapper::Timeout));
-        assert!(w.contains(&Wrapper::BashC));
+        assert!(w.contains(&Wrapper::PassThrough)); // timeout → PassThrough
+        assert!(w.contains(&Wrapper::Shell));
     }
 
     #[test]
@@ -981,7 +925,7 @@ mod tests {
         let c = cmds("find /var/log -name '*.log' -delete");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].argv[0], "rm");
-        assert!(c[0].wrappers.contains(&Wrapper::FindDelete));
+        assert!(c[0].wrappers.contains(&Wrapper::Find));
     }
 
     #[test]

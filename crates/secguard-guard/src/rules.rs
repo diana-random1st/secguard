@@ -46,7 +46,7 @@ const RULES: &[Rule] = &[
     rule_rm_family,
     rule_sql_destructive,
     rule_unsafe_kill,
-    rule_docker_prune,
+    rule_docker,
     rule_pipe_to_shell,
     rule_shred,
     rule_no_verify,
@@ -60,8 +60,6 @@ const RULES: &[Rule] = &[
     rule_heroku_pg_reset,
     rule_helm_mutation,
     rule_kubectl_destructive,
-    rule_docker_push,
-    rule_docker_container_rm,
     rule_gsutil_mutation,
     rule_netlify_sites_delete,
     rule_railway_down,
@@ -648,26 +646,38 @@ fn rule_unsafe_kill(c: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHi
     ))
 }
 
-fn rule_docker_prune(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
+fn rule_docker(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
     if c.head() != Some("docker") {
         return None;
     }
-    let pos: Vec<&str> = c
-        .args()
-        .iter()
-        .filter(|t| !t.starts_with('-'))
-        .map(String::as_str)
-        .collect();
-    if matches!(
-        pos.as_slice(),
-        ["system", "prune", ..] | ["volume", "prune", ..]
-    ) {
-        return Some((
+    const DOCKER_FLAG_VALS: &[&str] = &[
+        "-H",
+        "--host",
+        "--context",
+        "--config",
+        "--log-level",
+        "--tls-cacert",
+        "--tls-cert",
+        "--tls-key",
+    ];
+    let pos = positional_after_flags(c.args(), DOCKER_FLAG_VALS);
+    let first = pos.first().copied();
+    let second = pos.get(1).copied();
+    match (first, second) {
+        (Some("system" | "volume"), Some("prune")) => Some((
             RuleId::DockerPrune,
             "docker prune (removes containers/volumes permanently)".into(),
-        ));
+        )),
+        (Some("push"), Some(_)) => Some((
+            RuleId::DockerPush,
+            "docker push (publishes image to registry)".into(),
+        )),
+        (Some("rm"), _) | (Some("container"), Some("rm")) => Some((
+            RuleId::SaasDestroy,
+            "container destruction (docker rm)".into(),
+        )),
+        _ => None,
     }
-    None
 }
 
 fn rule_pipe_to_shell(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
@@ -1101,58 +1111,6 @@ fn rule_kubectl_destructive(c: &EffectiveCommand, _: &GuardConfig) -> Option<Rul
     None
 }
 
-fn rule_docker_push(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
-    if c.head() != Some("docker") {
-        return None;
-    }
-    const DOCKER_FLAG_VALS: &[&str] = &[
-        "-H",
-        "--host",
-        "--context",
-        "--config",
-        "--log-level",
-        "--tls-cacert",
-        "--tls-cert",
-        "--tls-key",
-    ];
-    let positional = positional_after_flags(c.args(), DOCKER_FLAG_VALS);
-    if positional.first().copied() == Some("push") && positional.len() >= 2 {
-        Some((
-            RuleId::DockerPush,
-            "docker push (publishes image to registry)".into(),
-        ))
-    } else {
-        None
-    }
-}
-
-fn rule_docker_container_rm(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
-    if c.head() != Some("docker") {
-        return None;
-    }
-    const DOCKER_FLAG_VALS: &[&str] = &[
-        "-H",
-        "--host",
-        "--context",
-        "--config",
-        "--log-level",
-        "--tls-cacert",
-        "--tls-cert",
-        "--tls-key",
-    ];
-    let positional = positional_after_flags(c.args(), DOCKER_FLAG_VALS);
-    let first = positional.first().copied();
-    let second = positional.get(1).copied();
-    if first == Some("rm") || (first == Some("container") && second == Some("rm")) {
-        Some((
-            RuleId::SaasDestroy,
-            "container destruction (docker rm)".into(),
-        ))
-    } else {
-        None
-    }
-}
-
 fn rule_gsutil_mutation(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> {
     if c.head() != Some("gsutil") {
         return None;
@@ -1382,14 +1340,11 @@ fn positional_after_flags<'a>(args: &'a [String], flags_with_val: &[&str]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{parse, ParseOutcome};
+    use crate::ast::parse;
 
     fn classify_str(cmd: &str) -> Option<RuleHit> {
         let cfg = GuardConfig::default();
-        let cmds = match parse(cmd) {
-            ParseOutcome::Ok(c) | ParseOutcome::Partial { commands: c, .. } => c,
-            ParseOutcome::Failed => Vec::new(),
-        };
+        let cmds = parse(cmd).commands;
         for c in &cmds {
             if let Some(hit) = classify(c, &cfg) {
                 return Some(hit);

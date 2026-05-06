@@ -9,7 +9,7 @@
 //! and reports whether any rm-family command was located and its
 //! verdict.
 
-use crate::ast::{self, EffectiveCommand, ParseOutcome, SpanKind};
+use crate::ast::{self, EffectiveCommand, SpanKind};
 use crate::config::GuardConfig;
 use crate::rule_id::RuleId;
 
@@ -39,12 +39,8 @@ pub enum RmCheck {
 /// command was located and none fired, the result is `Safe`. Otherwise
 /// `NotFound`.
 pub fn check_rm(cmd: &str, config: &GuardConfig) -> RmCheck {
-    let commands = match ast::parse(cmd) {
-        ParseOutcome::Ok(c) | ParseOutcome::Partial { commands: c, .. } => c,
-        ParseOutcome::Failed => return RmCheck::NotFound,
-    };
     let mut found_any_rm = false;
-    for ec in &commands {
+    for ec in &ast::parse(cmd).commands {
         if !is_rm_family(ec) {
             continue;
         }

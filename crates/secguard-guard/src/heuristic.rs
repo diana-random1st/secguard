@@ -7,7 +7,7 @@
 //! Asymmetric fail-open semantics — parse error before a trigger
 //! keyword → Safe; after → ask — live in [`crate::lib::check_detailed`].
 
-use crate::ast::{self, ParseOutcome, SpanKind};
+use crate::ast::{self, SpanKind};
 use crate::config::GuardConfig;
 use crate::rule_id::RuleId;
 
@@ -22,11 +22,7 @@ pub type RuleHit = (RuleId, String);
 /// remaining unparseable input is handled by the dispatcher's
 /// asymmetric fail-open policy in [`crate::lib::check_detailed`].
 pub fn check_destructive(cmd: &str, config: &GuardConfig) -> Option<RuleHit> {
-    let commands = match ast::parse(cmd) {
-        ParseOutcome::Ok(c) | ParseOutcome::Partial { commands: c, .. } => c,
-        ParseOutcome::Failed => return None,
-    };
-    for ec in &commands {
+    for ec in &ast::parse(cmd).commands {
         if ec.span != SpanKind::Executed {
             continue;
         }

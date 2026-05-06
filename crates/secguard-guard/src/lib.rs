@@ -89,11 +89,9 @@ pub fn check_detailed(cmd: &str, config: &GuardConfig) -> VerdictDetail {
         };
     }
 
-    let (commands, had_parse_issue) = match ast::parse(cmd) {
-        ast::ParseOutcome::Ok(c) => (c, false),
-        ast::ParseOutcome::Partial { commands, .. } => (commands, true),
-        ast::ParseOutcome::Failed => (Vec::new(), true),
-    };
+    let parsed = ast::parse(cmd);
+    let commands = parsed.commands;
+    let had_parse_issue = parsed.had_error;
 
     for ec in &commands {
         if ec.span != ast::SpanKind::Executed {
