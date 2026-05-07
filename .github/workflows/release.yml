@@ -123,12 +123,16 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push (linux/amd64, linux/arm64)
+      - name: Build and push (linux/amd64)
+        # amd64-only: k8s and server fleets are x86_64; macOS arm64
+        # devs run images via Rosetta 2. arm64 cross-compile through
+        # QEMU added ~12 min per release run for ~no audience. Bring
+        # arm64 back when we have a real arm64 deploy target.
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
