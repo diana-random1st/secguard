@@ -1,1 +1,11 @@
-features: []
+features:
+- id: feat.guard-indirection-hardening
+  spec_path: packages/feat.guard-indirection-hardening__20260507.s5d.yaml
+  status: applied
+  product: secguard
+  version: 1.0.0
+- id: decision.guard-indirection-hardening
+  spec_path: packages/decision.guard-indirection-hardening__20260507.s5d.yaml
+  status: applied
+  product: secguard
+  version: 1.0.0

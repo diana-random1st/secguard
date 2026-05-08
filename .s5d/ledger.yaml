@@ -1,2 +1,16 @@
 schema: '1.0'
-entries: []
+entries:
+- spec_sha256: sha256:4dab0732981ba3f9f6d3899aa1805081ace8f96b38eee165a5acddc21c116da8
+  state_fingerprint: sha256:2aae4dba89fa45bc7e5d38cf8f12354171dd0fb160c33704c71c9877b3ad37ed
+  package_id: feat.guard-indirection-hardening
+  action: import
+  status: success
+  timestamp: 2026-05-07T20:27:06.997371+00:00
+  record_ref: records/feat.guard-indirection-hardening__20260507.record.yaml
+- spec_sha256: sha256:ca30a8e1f8df03a9b92bc5938a452ce694703316efea13e3ec1073e92e4c69f2
+  state_fingerprint: sha256:3008eb51bbdf41a9decb6e31f79d9746f2ee4fbe9c4bbcda654f7deefaf29c0b
+  package_id: decision.guard-indirection-hardening
+  action: import
+  status: success
+  timestamp: 2026-05-07T20:27:33.967082+00:00
+  record_ref: records/decision.guard-indirection-hardening__20260507.record.yaml

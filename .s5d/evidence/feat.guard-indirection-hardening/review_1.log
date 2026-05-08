@@ -1,0 +1,1 @@
+review gate failed (built-in): no evidence with type=gate:review and verdict=pass found. Decision/high-tier specs require >=1 code review recorded as evidence. Use: s5d add-evidence <spec> --hypothesis-id <id> --evidence-type gate:review --content '<reviewer findings>' --verdict pass --formality <1-5> --claim-scope <scope> --reliability <0..1>

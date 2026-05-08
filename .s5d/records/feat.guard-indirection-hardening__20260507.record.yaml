@@ -1,0 +1,114 @@
+spec_ref: feat.guard-indirection-hardening__20260507.s5d.yaml
+spec_sha256: sha256:9c6d4bf54da33464c0666a7150761afee233328dd1c35b1d55094151cfbcf21d
+status: operated
+sync_status: synced
+status_history:
+- status: proposed
+  timestamp: 2026-05-07T20:04:12.542687+00:00
+- status: previewed
+  timestamp: 2026-05-07T20:26:04.069041+00:00
+- status: approved
+  timestamp: 2026-05-07T20:26:08.886691+00:00
+- status: previewed
+  timestamp: 2026-05-07T20:26:44.646702+00:00
+- status: approved
+  timestamp: 2026-05-07T20:26:50.898983+00:00
+- status: applied
+  timestamp: 2026-05-07T20:27:07.007226+00:00
+- status: operated
+  timestamp: 2026-05-07T20:41:08.938739+00:00
+active_phase: null
+phase_history: []
+phase_runs: []
+approvals:
+- reviewer: random1st
+  date: 2026-05-07T20:26:08.886689+00:00
+  spec_sha256: sha256:99df36c355dea77bfb67d55073520c88b1149ab72605c3c38db991eb0ffcd33b
+  diff_sha256: sha256:1956a35392b97c608d882c138ed83a22fc5b0bb7f10c3168ee252f51d27f15c2
+- reviewer: random1st
+  date: 2026-05-07T20:26:50.898981+00:00
+  spec_sha256: sha256:4dab0732981ba3f9f6d3899aa1805081ace8f96b38eee165a5acddc21c116da8
+  diff_sha256: sha256:1956a35392b97c608d882c138ed83a22fc5b0bb7f10c3168ee252f51d27f15c2
+preview:
+  diff_sha256: sha256:1956a35392b97c608d882c138ed83a22fc5b0bb7f10c3168ee252f51d27f15c2
+  previewed_spec_sha256: sha256:4dab0732981ba3f9f6d3899aa1805081ace8f96b38eee165a5acddc21c116da8
+  actions:
+    create: 9
+    link: 7
+    update: 0
+    delete: 0
+  log: null
+reflection:
+  verdict: iterate
+  measurement_window: null
+  telemetry_refs: []
+  summary: Envelope predicate landed. v1 closed headline + 9 v1-tribunal bypasses. v2 tribunal found 7 adjacent classes (heredoc to shell, bash <(...) as script, body-position injection in eval/bash -c, refused-trusted-env shadow, ANSI-C $'X' obfuscation, backslash-escape head, read/printf -v binding mutation); 7/7 closed in the same PR. 20 bypass + 15 negative corpus tests added; cargo test 359/359 green on workspace. One known limitation remaining (function-call mutation `f(){a=…}; f; $a`) — documented; future work.
+  worked: []
+  issues:
+  - function-call-mutation-still-open
+  - heredoc-redirect-only-handles-redirected_statement-shape
+  - token-decode-doesnt-handle-ansi-c-escape-sequences
+  structured_issues: []
+  follow_ups: []
+  evidence: []
+  heuristics:
+  - 'Tribunal first, target-state spec second, code third. The headline patch alone produced a partial fix that introduced collateral; the envelope spec made the target invariant explicit, which made the v2 audit''s findings actionable in one PR instead of three. Specifically: when defining "any indirection in execution position is destructive", enumerate execution position upfront — not just argv[0], but body of every shell wrapper, every redirect that feeds executable input, and any token-decoding step that runs at parse time.'
+gate_results:
+- kind: schema
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:26:13.644516+00:00
+  log: schema validation passed (built-in)
+  exit_code: null
+  evidence_path: evidence/feat.guard-indirection-hardening/schema_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: graph
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:26:13.644584+00:00
+  log: graph check passed (built-in)
+  exit_code: null
+  evidence_path: evidence/feat.guard-indirection-hardening/graph_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: review
+  status: failed
+  attempt: 1
+  timestamp: 2026-05-07T20:26:13.644644+00:00
+  log: 'review gate failed (built-in): no evidence with type=gate:review and verdict=pass found. Decision/high-tier specs require >=1 code review recorded as evidence. Use: s5d add-evidence <spec> --hypothesis-id <id> --evidence-type gate:review --content ''<reviewer findings>'' --verdict pass --formality <1-5> --claim-scope <scope> --reliability <0..1>'
+  exit_code: null
+  evidence_path: evidence/feat.guard-indirection-hardening/review_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: schema
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:26:56.495305+00:00
+  log: schema validation passed (built-in)
+  exit_code: null
+  evidence_path: evidence/feat.guard-indirection-hardening/schema_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: graph
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:26:56.495369+00:00
+  log: graph check passed (built-in)
+  exit_code: null
+  evidence_path: evidence/feat.guard-indirection-hardening/graph_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+decision: null
+verified_by: random1st
+drift_tolerance: null

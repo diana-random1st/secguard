@@ -1,0 +1,2 @@
+review gate passed (built-in): 1 review-evidence with verdict=pass
+  - hypothesis=single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive evidence_id=20260507-gate-review-single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive formality=4

@@ -1,0 +1,205 @@
+s5d: '1.0'
+id: feat.guard-indirection-hardening
+version: 1.0.0
+product: secguard
+tier: standard
+allow_update: true
+meta:
+  title: Guard indirection hardening — envelope predicate
+  authors:
+  - random1st
+  date: 2026-05-07
+  tickets: []
+  adrs: []
+  renames: []
+context: |
+  ## Problem
+  Variable indirection and command substitution in command position
+  silently bypass the destructive-command guard. Headline (`a="rm /
+  -rf" && $a`) closed by current uncommitted patch. Tribunal (Codex
+  high + Gemini flash) verified 9 adjacent classes still produce
+  false-negative `safe`. See decision.guard-indirection-hardening
+  for the full inventory and the framing decision.
+
+  ## Goal
+  Implement the envelope predicate: any unresolvable indirection in
+  execution position is destructive. Resolve when statically possible
+  via lexical bindings + boot-time env; emit unified
+  `__indirect_unresolved__` marker otherwise. Uniform across head,
+  bash/sh/eval bodies, source argument, here-string body, and
+  command-substitution that escapes its scope.
+
+  ## Privacy
+  Classification: Internal
+workflow:
+  mode: plan
+  target_architecture:
+    summary: |
+      ast.rs Walker emits __indirect_unresolved__ for any execution-position
+      construct (command head, bash/sh/eval body, source arg, here-string body,
+      escaped command substitution) that contains expansion which expand_vars
+      cannot fully resolve. Resolution sources: lexical bindings (current),
+      boot-time process env for known-safe vars (HOME, PWD, EDITOR, PAGER, VISUAL,
+      BROWSER, SHELL). Scope rules mirror bash: subshell `(...)`,
+      command_substitution `$(...)`, process_substitution `<(...)`, and function
+      bodies do NOT leak bindings. Function-body assignments are NOT recorded at
+      definition time. eval body uses the same bindings path as bash -c (no
+      separate __eval_dynamic__ branch when bindings resolve). The marker is
+      destructive-with-reason, surfacing through the existing `IndirectUnresolved`
+      RuleId.
+    invariants:
+    - indirect_command_no_silent_safe — every dynamic execution position resolves or marks
+    - scope_isolation_matches_bash — subshell/$()/<()/function bodies do not leak bindings
+    - bounded_envvar_trust — only boot-time env (not shell-set) feeds the safe-var allowlist
+  delivery_strategy:
+    summary: |
+      One PR. Refactor the headline patch into the envelope predicate; add
+      coverage for all 10 verified bypasses + ≥10 negatives; re-run tribunal.
+    rationale: |
+      The headline patch is uncommitted. Rolling it forward into the envelope
+      design avoids two separate audit cycles. The envelope predicate is
+      smaller than enumerating Block A+B+C separately.
+  resources: null
+  role_map:
+    owner: human
+    verifier: reviewer
+    implementer: coder
+    reviewer: reviewer
+  review_policy:
+    cross_model_required: false
+    required_on: []
+  structure_outline: null
+  execution_mode:
+    engine: manual
+    max_iterations: null
+    stop_conditions:
+    - Phase acceptance reached
+    - Approved scope exhausted
+    - New decision required
+  phases:
+  - id: prototype
+    title: Prototype
+    scope: Reduce unknowns before committed implementation
+    roles:
+    - owner
+    - implementer
+    acceptance:
+    - Critical feasibility questions answered
+    - Telemetry approach identified
+    rollback:
+    - Discard spike output if assumptions fail
+  - id: build
+    title: Build
+    scope: Implement approved scope and pass local gates
+    roles:
+    - implementer
+    - reviewer
+    acceptance:
+    - Declared gates pass
+    - Change matches approved scope
+    rollback:
+    - Revert or reconcile if gates or review fail
+  - id: measure
+    title: Measure
+    scope: Collect telemetry and close the loop with an explicit verdict
+    roles:
+    - owner
+    - verifier
+    acceptance:
+    - Telemetry collected against success criteria
+    - Outcome verdict recorded
+    rollback:
+    - Iterate or kill if evidence stays weak
+artifacts:
+  products:
+  - id: secguard
+    name: secguard
+    organization: null
+  domains:
+  - id: guard
+    name: Guard
+    product: secguard
+    classification: core
+    description: Shell-command classification before agent execution.
+  capabilities:
+  - id: ast_classify
+    name: AST-based classification
+    domain: guard
+    description: Parse shell text into a flat EffectiveCommand stream that predicate rules consume.
+  entities: []
+  features:
+  - id: feat.guard-indirection-hardening
+    product: secguard
+    name: guard-indirection-hardening
+    description: Envelope predicate for indirect commands.
+  use_cases: []
+  systems:
+  - id: secguard-system
+    name: secguard
+    product: secguard
+    description: 3-level security toolkit for AI agents.
+  containers:
+  - id: secguard-guard-crate
+    name: secguard-guard
+    system: secguard-system
+    description: Guard library crate that the CLI and MCP server depend on.
+  components:
+  - id: ast_walker
+    name: AST walker
+    feature: feat.guard-indirection-hardening
+    domain: guard
+    capability: ast_classify
+    container: secguard-guard-crate
+    paths:
+    - crates/secguard-guard/src/ast.rs
+  - id: rules
+    name: Predicate rules
+    feature: feat.guard-indirection-hardening
+    domain: guard
+    capability: ast_classify
+    container: secguard-guard-crate
+    paths:
+    - crates/secguard-guard/src/rules.rs
+  - id: rule_id
+    name: Rule ID enum
+    feature: feat.guard-indirection-hardening
+    domain: guard
+    capability: ast_classify
+    container: secguard-guard-crate
+    paths:
+    - crates/secguard-guard/src/rule_id.rs
+  roles: []
+  concerns: []
+  metrics: []
+  supersystems: []
+  transports: []
+links:
+  feature_to_domain: []
+  use_case_to_capability: []
+  use_case_to_entity: []
+  component_to_capability: []
+  component_to_entity: []
+  container_to_capability: []
+  concern_to_metric: []
+  component_to_container: []
+  edges: []
+  depends_on: []
+  entity_relations: []
+  capability_to_entity: []
+  capability_to_concern: []
+contracts: []  # Behavioral invariants live on the linked decision spec
+gates:
+- kind: schema
+- kind: graph
+# Review is recorded on the linked decision spec
+# (decision.guard-indirection-hardening) via the tribunal evidence;
+# the implementation gate here is structural (schema+graph). A
+# tribunal re-run on the implementation diff is part of the ship
+# checklist, not a YAML gate.
+roc: null
+problem: null
+hypotheses: []
+decision: null
+note_rationale: null
+expires_at: null
+auto_noted: false

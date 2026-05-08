@@ -704,6 +704,18 @@ fn rule_pipe_to_shell(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> 
             format!("eval of dynamic input (unknown body): {body}"),
         ));
     }
+    // `a="rm -rf /"; $a` and `bash -c "$a"` with `a` unbound (or set
+    // via read/$(cmd)) reach here. With a known binding the AST
+    // walker resolves textually; only opaque indirection lands as
+    // this marker — guard semantics prefer a conservative ask over
+    // silent allow.
+    if c.head() == Some("__indirect_unresolved__") {
+        let body = c.args().first().map(String::as_str).unwrap_or("");
+        return Some((
+            RuleId::IndirectUnresolved,
+            format!("indirect command via unresolved variable: {body}"),
+        ));
+    }
     None
 }
 

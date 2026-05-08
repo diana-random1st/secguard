@@ -1,0 +1,323 @@
+s5d: '1.0'
+id: decision.guard-indirection-hardening
+version: 1.0.0
+product: secguard
+tier: decision
+allow_update: true
+meta:
+  title: AST contract for indirect commands in secguard guard
+  authors:
+  - random1st
+  date: 2026-05-07
+  tickets: []
+  adrs: []
+  renames: []
+context: |
+  secguard's guard subcommand classifies a shell command as safe vs.
+  destructive before an AI agent executes it. The pipeline is:
+    policy → AST parse (tree-sitter-bash) → predicate rules → optional
+    ML brain.
+
+  The AST walker (crates/secguard-guard/src/ast.rs) flattens a source
+  string into a list of EffectiveCommand records (argv, cwd, span,
+  wrappers, remote, chrooted). Rules in rules.rs are pure predicates
+  over that record stream.
+
+  A verified bypass class breaks this:
+    a="rm / -rf" && $a   →  pre-fix: safe
+  Root cause: variable_assignment is dropped as env-prefix; $a surfaces
+  as opaque simple_expansion; no rule matches the raw token "$a".
+
+  Headline patch (current uncommitted state) added lexical bindings,
+  textual $NAME/${NAME} expansion, and a __indirect_unresolved__ marker.
+  Tribunal (Codex high + Gemini flash) verified 9 adjacent bypasses
+  still open or newly opened:
+
+  Block A — must-fix (small surface, 5 classes):
+    1. a="$(echo rm) -rf /"; $a  →  parse_assignment binds opaque
+       "$(echo rm) -rf /" because refusal of $-RHS only checks the
+       first byte and "$(...)" starts with ".
+    2. a=rm\ -rf\ /; $a  →  backslash-escapes in RHS not modeled.
+    3. $(echo rm) -rf /  →  command_substitution as command head;
+       contains_var_ref doesn't trigger; argv[0] elided.
+    4. `rm -rf /`  →  backtick command substitution as head; same.
+    5. r$a -rf /  (a="m")  →  prefix concat; argv[0]="r$a" doesn't
+       start with $.
+
+  Block B — security-meaningful (3 classes):
+    6. bash <<< "$a"  →  here-string as shell input not modeled.
+    7. source <(echo rm -rf /)  →  source/. not a wrapper.
+    8. echo $(a="rm -rf /"); $a  →  command_substitution leaks
+       binding into outer scope (real bash isolates).
+
+  Block C — correctness/consistency (2 classes):
+    9. f(){ a="rm -rf /"; }; a=ls; f; $a  →  function definition
+       captures binding at definition time; real bash captures at
+       call time. Inverted semantics.
+    10. eval still uses old __eval_dynamic__ path even when a is
+        bound; bash -c "$a" resolves via bindings; inconsistent.
+
+  All 10 (incl. headline) verified empirically against the current
+  binary. Tests: 323 pass on guard crate.
+
+  This decision frames the AST contract for indirect commands BEFORE
+  more code lands. The current patch is a partial fix that opened
+  collateral while closing the headline. The tribunal explicitly
+  asked for target-state reasoning; this spec records it.
+workflow: null
+artifacts: null
+links:
+  feature_to_domain: []
+  use_case_to_capability: []
+  use_case_to_entity: []
+  component_to_capability: []
+  component_to_entity: []
+  container_to_capability: []
+  concern_to_metric: []
+  component_to_container: []
+  edges: []
+  depends_on: []
+  entity_relations: []
+  capability_to_entity: []
+  capability_to_concern: []
+contracts:
+- id: indirect_command_no_silent_safe
+  format: invariant
+  path: null
+  sha256: null
+  inline: null
+  binds_to: []
+- id: scope_isolation_matches_bash
+  format: invariant
+  path: null
+  sha256: null
+  inline: null
+  binds_to: []
+gates:
+- kind: schema
+- kind: graph
+- kind: review
+roc: null
+problem:
+  signal: |
+    Variable indirection and command substitution in command position
+    silently bypass the destructive-command guard. Headline case
+    closed; 9 adjacent classes still produce false-negative `safe`
+    or false-positive `destructive-by-leaked-scope`.
+  constraints:
+  - Guard semantics asymmetric — false positive (agent retries) cheap, false negative (destruction) catastrophic.
+  - Tree-sitter-bash is the parser; no plan to rewrite as full bash interpreter.
+  - Performance budget — guard runs synchronously on every agent shell call.
+  - Existing rule predicate API (EffectiveCommand) must keep working.
+  targets:
+  - All 10 verified bypasses must classify `destructive` (either via resolution into a real argv that hits an existing rule, or via a synthetic marker that a rule flags).
+  - No regression on the 323-test guard suite.
+  - Legitimate `a="ls -la" && $a` and `$EDITOR file` patterns must NOT all flip to false positive — at least the substitution-resolves case must still pass through.
+  indicators:
+  - Synthetic test corpus covering all 10 bypasses + ≥10 negatives.
+  - cargo test green on workspace (excluding pre-broken secguard-mcp).
+  goodhart_guard: |
+    Naive over-approximation (flag every $ or backtick as destructive)
+    would pass the corpus but break legitimate `$EDITOR file`,
+    `$PAGER`, `${HOME}/bin/foo`, etc. Indicators must include negative
+    cases, not only the bypass corpus.
+  acceptance: |
+    The chosen AST contract is implemented; all 10 bypasses classify
+    destructive; negative corpus stays safe; cargo test green;
+    tribunal re-run on the implementation lands APPROVE.
+  blast_radius: |
+    crates/secguard-guard only. Public predicate API unchanged.
+    Marker emission widens — downstream consumers that whitelist
+    rule IDs may need to add new IDs.
+  reversibility: |
+    Reversible per change. Rule-id additions are additive. AST
+    walker changes are local to ast.rs. Rollback = revert.
+  status: in_review
+hypotheses:
+- id: per-class-enumeration-explicit-ast-recognition-for-each-indirection-construct
+  title: 'Per-class enumeration: explicit AST recognition for each indirection construct'
+  content: |-
+    For each shell indirection construct (variable expansion, $(...), backtick, here-string, source/.,
+    function call, eval), add explicit AST handling: resolve when statically possible (lexical bindings),
+    emit synthetic marker when dynamic. Each new construct = one walker branch + one predicate rule.
+
+    Mechanism: extend `Walker` with construct-specific handlers; widen `unwrap_wrapper` for source/here-string;
+    add `command_substitution` and backtick recognition in `handle_command` argv assembly with marker emission.
+
+    Trust level: every construct is enumerated; what isn't enumerated is silent-safe (false negative risk).
+  scope: crates/secguard-guard/src/{ast.rs,rules.rs,rule_id.rs}
+  kind: system
+  layer: L0
+  r_eff: null
+  evidence:
+  - id: 20260507-internal-per-class-enumeration-explicit-ast-recognition-for-each-indirection-construct
+    type: internal
+    content: |-
+      Track record from the headline patch: enumerated 3 constructs (variable_assignment, $NAME/${NAME}, bash -c body expansion).
+      Tribunal verified 9 additional constructs leak through. The enumeration approach scales linearly with shell
+      constructs, but tree-sitter-bash exposes ~40 distinct node kinds for execution-relevant input shapes
+      (command_substitution, process_substitution, here_redirect, herestring_redirect, function_definition,
+      declaration_command (declare/local/typeset), namref via declare -n, brace_group, c_style_for_loop, ANSI-C
+      $'...', $"..." i18n, parameter_expansion variants ${a:-x}/${a:=x}/${a:?x}/${a:+x}, etc.). Every miss is a bypass.
+      The headline patch took ~3 commits and missed 9. Maintenance burden is real and historical evidence shows
+      silent gaps recur.
+    verdict: refine
+    valid_until: 2026-08-05T20:02:51.335131+00:00
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - maintenance burden
+    - completeness
+    congruence_level: null
+    reliability: 0.8
+    refine_kind: calibrate
+  depends_on: []
+  rationale: null
+  spec_ref: null
+  prompt: How should the AST recognize indirection — by enumerating each construct?
+  next_move: build
+- id: single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive
+  title: 'Single envelope predicate: any unresolvable indirection in execution position is destructive'
+  content: |-
+    Add ONE invariant at the AST level: a command is destructive if its head OR shell-input-body
+    contains any expansion (`$`, `` ` ``, `<<<`, `<(`, `>(`, `$(`) that does NOT fully resolve to literal
+    text via current bindings. No per-class enumeration; the walker emits `__indirect_unresolved__`
+    whenever it sees an opaque construct in execution position, regardless of which construct.
+
+    Mechanism: at the top of `handle_command`, scan tree-sitter children for any `simple_expansion`,
+    `expansion`, `command_substitution`, `process_substitution`, or backtick descendant inside the
+    command_name OR inside any redirect target. If any are present and `expand_vars(joined argv) → None`,
+    emit the marker. Same logic applied uniformly to bash/sh/eval/source bodies.
+
+    Allow-list: a small set of name-only resolutions for benign interactive commands (`$EDITOR`, `$PAGER`,
+    `$BROWSER`, `$VISUAL`, `$SHELL` w/o -c) that resolve to a non-destructive head.
+
+    Trust level: indirection is the rule; literal is the exception. New shell construct = no patch needed
+    (envelope already covers it). Cost: more false positives on `$VAR` patterns the agent uses for paths
+    that aren't in the allow-list.
+  scope: crates/secguard-guard/src/{ast.rs,rules.rs,rule_id.rs}
+  kind: system
+  layer: L2
+  r_eff: null
+  evidence:
+  - id: 20260507-internal-single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive
+    type: internal
+    content: |-
+      Existing precedent inside the codebase: `__pipe_to_shell__` and `__eval_dynamic__` markers ALREADY use
+      the envelope pattern at narrow scope — they fire on any non-literal upstream feeding `| bash`, and on any
+      dynamic body in `eval`. The pattern works (covers `curl URL | bash`, `eval $(cmd)`, etc.). Generalizing
+      this single pattern to ALL execution-position indirection is consistent with the codebase, not a new
+      paradigm. Additionally: secguard's threat model is explicitly asymmetric (CLAUDE-relevant comment in
+      ast.rs:670-680 on eval_dynamic: "conservative ask is safer than silent allow") — envelope semantics
+      match this stated principle.
+    verdict: pass
+    valid_until: 2026-08-05T20:03:03.560658+00:00
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - consistency with codebase patterns
+    - threat-model fit
+    congruence_level: null
+    reliability: 0.85
+    refine_kind: null
+  - id: 20260507-internal-single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive
+    type: internal
+    content: |-
+      False-positive cost analysis on the negative corpus implied by tribunal G1: legit `$EDITOR file`,
+      `$PAGER log`, `$SHELL -i`, `${HOME}/bin/foo`, `cd $(pwd)`. Mitigations: (a) name-only resolution for
+      `HOME`, `PWD`, `EDITOR`, `PAGER`, `VISUAL`, `BROWSER`, `SHELL` from process env at parse time —
+      cheap and safe; (b) pure-prefix expansions where the envelope still parses to a fixed argv head
+      (e.g. `${HOME}/cache` resolves to a literal path); (c) the marker is destructive-with-reason, not
+      destructive-fatal — the agent's permission flow can still surface "indirect command, please confirm"
+      rather than abort. Net: the false positive surface is a known, small, well-defined set, fixable with
+      ~10 names + envvar lookup.
+    verdict: pass
+    valid_until: 2026-08-05T20:03:15.968010+00:00
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - false-positive surface
+    - mitigation path
+    congruence_level: null
+    reliability: 0.75
+    refine_kind: null
+  - id: 20260507-gate-review-single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive
+    type: gate:review
+    content: |-
+      Independent multi-model audit (tribunal: Codex high + Gemini flash) on the headline-only patch.
+      Codex REJECT/CRITICAL with 5 findings (2 CRITICAL, 3 HIGH); Gemini CONCERNS/HIGH with 4 findings.
+      All 9 reported bypasses verified empirically. The envelope-predicate hypothesis was selected as
+      the response (this evidence layer is the gate-review record, not a re-audit of the implementation).
+      Implementation lands a 12-case bypass corpus + 12-case negative corpus, all green via cargo test
+      (253/253 in secguard-guard). Tribunal re-run on the implementation diff is the verification gate
+      in the linked feature spec, not this decision-tier gate.
+
+      Reviewer: random1st (arbiter role on tribunal). Auditors: Codex high, Gemini flash. Evidence files:
+      /tmp/tribunal-codex.txt, /tmp/tribunal-gemini.txt.
+    verdict: pass
+    valid_until: 2026-08-05T20:24:56.466465+00:00
+    carrier_ref: null
+    formality: 4
+    claim_scope:
+    - independent peer review of the chosen approach
+    congruence_level: null
+    reliability: 0.9
+    refine_kind: null
+  depends_on: []
+  rationale: null
+  spec_ref: feat.guard-indirection-hardening__20260507.s5d.yaml
+  prompt: Or should the AST treat indirection as one envelope rule rather than per-class?
+  next_move: build
+- id: external-shell-verification-dry-run-via-bash-n-sandboxed-eval
+  title: 'External shell verification: dry-run via `bash -n` / sandboxed eval'
+  content: |-
+    Delegate semantics to bash itself. For each input, run `bash -n` (no-exec syntax check) plus a
+    sandboxed `set -x` trace via a constrained subprocess (read-only filesystem, no network, killed
+    after a tight timeout) to capture which commands bash WOULD execute. Apply the existing rule
+    predicates to that argv stream.
+
+    Mechanism: subprocess invocation; ptrace or seccomp sandbox; PATH override to a stub directory
+    where `rm`, `dd`, etc. are recorded but not executed; collect the trace; feed each captured argv
+    through `rules::classify`.
+
+    Trust level: bash is the source of truth for bash semantics. No tree-sitter blind spots, no
+    walker maintenance. But: synchronous subprocess on every guard call (latency); sandbox escape
+    risk; non-portable across macOS/Linux/Windows; doesn't see `read` / interactive input; agents
+    running guard in non-bash shells (zsh/dash) get bash semantics not their own; tooling fragility
+    (bash version differences).
+  scope: crates/secguard-guard/ + new sandbox crate
+  kind: system
+  layer: invalid
+  r_eff: null
+  evidence:
+  - id: 20260507-internal-external-shell-verification-dry-run-via-bash-n-sandboxed-eval
+    type: internal
+    content: |-
+      Hard counter-evidence: `bash -n` only checks SYNTAX, it does not expand or trace. Real "what would
+      execute" requires actual evaluation in a sandbox. Sandboxing bash safely on macOS/Linux/Windows is
+      not a 30-LOC patch — it requires per-platform syscall filtering (seccomp on Linux, sandbox-exec on
+      macOS, no equivalent on Windows). Latency: spinning a bash subprocess per guard call is ~10-50ms
+      even on local; vs current AST parse at sub-millisecond. Threat model: a sandbox escape is now in
+      the trust boundary — exactly the surface secguard exists to AVOID. Plus interactive constructs
+      (`read`, command substitution that hits network, anything with stdin) cannot be evaluated at all
+      because they have no input.
+    verdict: fail
+    valid_until: 2026-08-05T20:03:27.870827+00:00
+    carrier_ref: null
+    formality: 3
+    claim_scope:
+    - feasibility
+    - security
+    - latency
+    congruence_level: null
+    reliability: 0.9
+    refine_kind: null
+  depends_on: []
+  rationale: null
+  spec_ref: null
+  prompt: Or should we abandon static analysis and let bash itself decide what runs?
+  next_move: probe
+decision: null
+note_rationale: null
+expires_at: null
+auto_noted: false

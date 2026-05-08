@@ -1,0 +1,96 @@
+spec_ref: decision.guard-indirection-hardening__20260507.s5d.yaml
+spec_sha256: sha256:572f6d11849d409adb308c34506fba40754e647ff1780fa4238ba57bfef2c228
+status: applied
+sync_status: synced
+status_history:
+- status: proposed
+  timestamp: 2026-05-07T19:41:49.131569+00:00
+- status: previewed
+  timestamp: 2026-05-07T20:27:17.973150+00:00
+- status: approved
+  timestamp: 2026-05-07T20:27:23.223451+00:00
+- status: applied
+  timestamp: 2026-05-07T20:27:33.977073+00:00
+active_phase: null
+phase_history: []
+phase_runs: []
+approvals:
+- reviewer: random1st
+  date: 2026-05-07T20:27:23.223449+00:00
+  spec_sha256: sha256:ca30a8e1f8df03a9b92bc5938a452ce694703316efea13e3ec1073e92e4c69f2
+  diff_sha256: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+preview:
+  diff_sha256: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  previewed_spec_sha256: sha256:ca30a8e1f8df03a9b92bc5938a452ce694703316efea13e3ec1073e92e4c69f2
+  actions:
+    create: 0
+    link: 0
+    update: 0
+    delete: 0
+  log: null
+reflection: null
+gate_results:
+- kind: schema
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:27:12.386589+00:00
+  log: schema validation passed (built-in)
+  exit_code: null
+  evidence_path: evidence/decision.guard-indirection-hardening/schema_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: graph
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:27:12.386667+00:00
+  log: graph check passed (built-in)
+  exit_code: null
+  evidence_path: evidence/decision.guard-indirection-hardening/graph_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+- kind: review
+  status: passed
+  attempt: 1
+  timestamp: 2026-05-07T20:27:12.386724+00:00
+  log: |-
+    review gate passed (built-in): 1 review-evidence with verdict=pass
+      - hypothesis=single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive evidence_id=20260507-gate-review-single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive formality=4
+  exit_code: null
+  evidence_path: evidence/decision.guard-indirection-hardening/review_1.log
+  command: null
+  duration_ms: 0
+  waiver_expires_at: null
+  kind_class: null
+decision:
+  title: Use envelope predicate for AST indirection contract
+  winner_id: single-envelope-predicate-any-unresolvable-indirection-in-execution-position-is-destructive
+  rejected_ids:
+  - per-class-enumeration-explicit-ast-recognition-for-each-indirection-construct
+  - external-shell-verification-dry-run-via-bash-n-sandboxed-eval
+  context: Tribunal verdict REJECT on partial per-class fix; 9 adjacent bypasses verified empirically.
+  decision: Adopt single envelope predicate — any unresolvable indirection in execution position emits __indirect_unresolved__. Lexical bindings + bounded boot-time env (HOME, PWD, EDITOR, PAGER, VISUAL, BROWSER, SHELL) drive resolution. Subshell, command_substitution, process_substitution, and function_definition isolate bindings.
+  rationale: Asymmetric threat model — false negative catastrophic, false positive cheap (agent retry). Envelope matches existing __pipe_to_shell__ / __eval_dynamic__ patterns. Per-class enumeration historically misses 9/10 classes per fix. External shell verification fails feasibility (sandbox-escape in trust boundary, latency 10-50ms, can't handle interactive constructs).
+  consequences: eval-vs-bash-c semantics unify; new RuleId::IndirectUnresolved variant covers all opaque-indirection cases; function-call mutation (f(){a=…}; f; $a) remains a known limitation — definition-time binding capture inverted from bash, documented in spec; downstream callers must accept the new RuleId.
+  decided_at: 2026-05-07T20:25:58.935186+00:00
+  confirmed_by: random1st
+  expires_at: 2026-08-05
+  do_list: []
+  dont_list: []
+  challenge:
+    mode: standard
+    passed: true
+    summary: '5 probes survived: (1) false-positive UX kill mitigated by env-name allowlist + destructive-ask semantics; (2) HOME=/ poisoning mitigated by trusting only boot-time env, not shell-set; (3) "matches codebase" not load-bearing — decisive arg is threat-model fit; (4) allowlist maintenance (~10 names) << shell construct enumeration (~40 node kinds); (5) heuristic.rs allowlist mechanism is complementary, not alternative.'
+    checks: []
+  decision_subject: null
+  decision_subject_granularity: null
+  evaluative_surface: null
+  belief_state: null
+  outcome_model: null
+  pareto_set: []
+  choice_rule: null
+verified_by: random1st
+drift_tolerance: null
