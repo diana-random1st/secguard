@@ -111,7 +111,7 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
 
     let start = std::time::Instant::now();
     let detail =
-        secguard_guard::check_detailed(&text_to_check, &secguard_guard::GuardConfig::default());
+        secguard_guard::check_detailed(&text_to_check, &secguard_guard::config::load());
     let latency_us = start.elapsed().as_micros();
 
     let (verdict_str, reason) = match &detail.verdict {

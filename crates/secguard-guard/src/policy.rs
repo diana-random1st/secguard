@@ -45,6 +45,102 @@ fn is_single_command_safe(cmd: &str, config: &GuardConfig) -> bool {
         ];
         return safe_ops.iter().any(|s| cmd.contains(s));
     }
+    // gws (Google Workspace CLI) — always safe
+    if cmd.starts_with("gws ") {
+        return true;
+    }
+    // diana CLI — safe unless the rest contains " rm " or "delete"
+    if cmd.starts_with("diana ") {
+        let rest = &cmd["diana ".len()..];
+        return !rest.contains(" rm ") && !rest.contains("delete");
+    }
+    // psql DB client — safe for read/query use; reject if command contains
+    // destructive SQL keywords (drop, delete, truncate, alter).
+    if cmd.starts_with("psql ") || cmd.starts_with("psql -") || cmd == "psql" {
+        let lower = cmd.to_ascii_lowercase();
+        let has_destructive_sql = ["drop ", "drop;", "delete ", "delete;", "truncate ", "truncate;", "alter ", "alter;"]
+            .iter()
+            .any(|kw| lower.contains(kw));
+        return !has_destructive_sql;
+    }
+    // terraform — only read/inspect subcommands are safe
+    if cmd.starts_with("terraform ") {
+        let safe_subs = [
+            "plan",
+            "show",
+            "output",
+            "validate",
+            "state list",
+            "state show",
+            "fmt",
+            "version",
+        ];
+        let rest = cmd["terraform ".len()..].trim_start();
+        return safe_subs.iter().any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
+    }
+    // brew — only read/install subcommands are safe; uninstall/cleanup are destructive
+    if cmd.starts_with("brew ") {
+        let safe_subs = [
+            "install",
+            "upgrade",
+            "list",
+            "info",
+            "search",
+            "update",
+            "outdated",
+            "tap",
+            "leaves",
+        ];
+        let rest = cmd["brew ".len()..].trim_start();
+        return safe_subs.iter().any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
+    }
+    // Package managers — safe subcommands only
+    if is_safe_package_manager_command(cmd) {
+        return true;
+    }
+    // User-defined safe prefixes from config
+    for prefix in &config.safe_command_prefixes {
+        let prefix = prefix.trim();
+        if !prefix.is_empty() && cmd.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when the command is a safe subcommand of a package manager
+/// (cargo, npm, bun, yarn, pnpm, pip, uv).
+///
+/// Conservative: only read/build/install subcommands are allowed.
+/// Destructive ones (cargo clean, npm uninstall, pip uninstall, etc.) are NOT included.
+fn is_safe_package_manager_command(cmd: &str) -> bool {
+    const SAFE_SUBCOMMANDS: &[&str] = &[
+        "build",
+        "check",
+        "test",
+        "install",
+        "ci",
+        "add",
+        "sync",
+        "run",
+        "list",
+        "show",
+        "info",
+        "search",
+        "version",
+        "--help",
+    ];
+    const MANAGERS: &[&str] = &["cargo", "npm", "bun", "yarn", "pnpm", "pip", "uv"];
+
+    for mgr in MANAGERS {
+        let prefix = format!("{mgr} ");
+        if let Some(rest) = cmd.strip_prefix(prefix.as_str()) {
+            let rest = rest.trim_start();
+            return SAFE_SUBCOMMANDS
+                .iter()
+                .any(|sub| rest == *sub || rest.starts_with(&format!("{sub} ")));
+        }
+    }
     false
 }
 
@@ -163,9 +259,160 @@ mod tests {
         assert!(!is_safe_by_policy("kill 12345", &cfg()));
     }
 
+    // ── New policy rules ──────────────────────────────────────────────────
+
+    // gws
     #[test]
-    fn psql_is_not_policy_safe() {
-        assert!(!is_safe_by_policy("psql -c 'select 1'", &cfg()));
+    fn gws_is_policy_safe() {
+        assert!(is_safe_by_policy("gws send-mail foo", &cfg()));
+        assert!(is_safe_by_policy("gws list-calendars", &cfg()));
+    }
+
+    // diana
+    #[test]
+    fn diana_is_policy_safe() {
+        assert!(is_safe_by_policy("diana search RAN-296", &cfg()));
+        assert!(is_safe_by_policy("diana router", &cfg()));
+    }
+
+    #[test]
+    fn diana_with_rm_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("diana store rm foo", &cfg()));
+    }
+
+    #[test]
+    fn diana_with_delete_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("diana store delete foo", &cfg()));
+    }
+
+    // psql
+    #[test]
+    fn psql_is_policy_safe() {
+        assert!(is_safe_by_policy("psql -c 'select 1'", &cfg()));
+        assert!(is_safe_by_policy("psql -U postgres mydb", &cfg()));
+    }
+
+    #[test]
+    fn psql_with_drop_table_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("psql -c 'DROP TABLE users'", &cfg()));
+        assert!(!is_safe_by_policy("psql -c 'delete from foo'", &cfg()));
+        assert!(!is_safe_by_policy("psql -c 'truncate logs'", &cfg()));
+    }
+
+    // terraform
+    #[test]
+    fn terraform_plan_is_policy_safe() {
+        assert!(is_safe_by_policy("terraform plan", &cfg()));
+        assert!(is_safe_by_policy("terraform plan -var-file=foo.tfvars", &cfg()));
+        assert!(is_safe_by_policy("terraform show", &cfg()));
+        assert!(is_safe_by_policy("terraform validate", &cfg()));
+        assert!(is_safe_by_policy("terraform fmt", &cfg()));
+        assert!(is_safe_by_policy("terraform version", &cfg()));
+        assert!(is_safe_by_policy("terraform output -json", &cfg()));
+        assert!(is_safe_by_policy("terraform state list", &cfg()));
+        assert!(is_safe_by_policy("terraform state show aws_s3_bucket.b", &cfg()));
+    }
+
+    #[test]
+    fn terraform_apply_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("terraform apply", &cfg()));
+        assert!(!is_safe_by_policy("terraform destroy", &cfg()));
+        assert!(!is_safe_by_policy("terraform taint foo", &cfg()));
+        assert!(!is_safe_by_policy("terraform import foo bar", &cfg()));
+    }
+
+    // brew
+    #[test]
+    fn brew_install_is_policy_safe() {
+        assert!(is_safe_by_policy("brew install ripgrep", &cfg()));
+        assert!(is_safe_by_policy("brew upgrade", &cfg()));
+        assert!(is_safe_by_policy("brew list", &cfg()));
+        assert!(is_safe_by_policy("brew info git", &cfg()));
+        assert!(is_safe_by_policy("brew search fd", &cfg()));
+        assert!(is_safe_by_policy("brew update", &cfg()));
+        assert!(is_safe_by_policy("brew outdated", &cfg()));
+        assert!(is_safe_by_policy("brew tap homebrew/cask", &cfg()));
+        assert!(is_safe_by_policy("brew leaves", &cfg()));
+    }
+
+    #[test]
+    fn brew_uninstall_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("brew uninstall ripgrep", &cfg()));
+        assert!(!is_safe_by_policy("brew cleanup", &cfg()));
+    }
+
+    // package managers
+    #[test]
+    fn cargo_safe_subcommands() {
+        assert!(is_safe_by_policy("cargo build", &cfg()));
+        assert!(is_safe_by_policy("cargo check", &cfg()));
+        assert!(is_safe_by_policy("cargo test", &cfg()));
+        assert!(is_safe_by_policy("cargo run --release", &cfg()));
+        assert!(is_safe_by_policy("cargo list", &cfg()));
+        assert!(is_safe_by_policy("cargo --help", &cfg()));
+    }
+
+    #[test]
+    fn cargo_clean_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("cargo clean", &cfg()));
+    }
+
+    #[test]
+    fn npm_safe_subcommands() {
+        assert!(is_safe_by_policy("npm install", &cfg()));
+        assert!(is_safe_by_policy("npm ci", &cfg()));
+        assert!(is_safe_by_policy("npm run build", &cfg()));
+        assert!(is_safe_by_policy("npm test", &cfg()));
+        assert!(is_safe_by_policy("npm list", &cfg()));
+    }
+
+    #[test]
+    fn npm_uninstall_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("npm uninstall lodash", &cfg()));
+    }
+
+    #[test]
+    fn bun_safe_subcommands() {
+        assert!(is_safe_by_policy("bun install", &cfg()));
+        assert!(is_safe_by_policy("bun run dev", &cfg()));
+        assert!(is_safe_by_policy("bun test", &cfg()));
+        assert!(is_safe_by_policy("bun add react", &cfg()));
+    }
+
+    #[test]
+    fn pip_safe_subcommands() {
+        assert!(is_safe_by_policy("pip install requests", &cfg()));
+        assert!(is_safe_by_policy("pip list", &cfg()));
+        assert!(is_safe_by_policy("pip show requests", &cfg()));
+        assert!(is_safe_by_policy("pip search requests", &cfg()));
+    }
+
+    #[test]
+    fn pip_uninstall_is_not_policy_safe() {
+        assert!(!is_safe_by_policy("pip uninstall requests", &cfg()));
+    }
+
+    #[test]
+    fn uv_safe_subcommands() {
+        assert!(is_safe_by_policy("uv sync", &cfg()));
+        assert!(is_safe_by_policy("uv add ruff", &cfg()));
+        assert!(is_safe_by_policy("uv run ruff check", &cfg()));
+    }
+
+    // user config prefixes
+    #[test]
+    fn user_config_prefix_allows_matching_command() {
+        let mut cfg = cfg();
+        cfg.safe_command_prefixes = vec!["rclone copy".into(), "tailscale status".into()];
+        assert!(is_safe_by_policy("rclone copy src dst", &cfg));
+        assert!(is_safe_by_policy("tailscale status", &cfg));
+    }
+
+    #[test]
+    fn user_config_prefix_does_not_allow_rm() {
+        let mut cfg = cfg();
+        cfg.safe_command_prefixes = vec!["rclone copy".into()];
+        assert!(!is_safe_by_policy("rm -rf /", &cfg));
     }
 
     // ── Tribunal-2: quoted refspec bypass ───────────────────────────────

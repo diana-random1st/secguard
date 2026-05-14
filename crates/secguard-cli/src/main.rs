@@ -32,7 +32,9 @@ enum Commands {
     },
     /// Check if a shell command is destructive
     Guard {
-        /// Command to check (reads from stdin if not provided)
+        #[command(subcommand)]
+        subcommand: Option<GuardSubcommand>,
+        /// Command to check (reads from stdin if not provided; only valid without subcommand)
         command: Option<String>,
     },
     /// Claude Code / Gemini CLI / Codex hook mode (reads hook JSON from stdin)
@@ -73,13 +75,34 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum GuardSubcommand {
+    /// Analyse telemetry and suggest safe_command_prefixes for config.toml
+    Suggest {
+        /// Number of top prefixes to show
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Minimum occurrence count to include a prefix
+        #[arg(long, default_value_t = 3)]
+        min_count: usize,
+        /// Path to telemetry JSONL file (default: ~/.secguard/telemetry.jsonl)
+        #[arg(long)]
+        telemetry: Option<String>,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Scan { dir, format } => cmd_scan::run(dir, &format),
-        Commands::Guard { command } => cmd_guard::run(command),
+        Commands::Guard { subcommand, command } => match subcommand {
+            Some(GuardSubcommand::Suggest { top, min_count, telemetry }) => {
+                cmd_guard::run_suggest(top, min_count, telemetry)
+            }
+            None => cmd_guard::run(command),
+        },
         Commands::Hook { mode, target } => hook::run(mode, target),
         Commands::Model { model, dir } => cmd_model::run(dir, model),
         Commands::Init { target, global } => cmd_init::run(target, global),

@@ -11,6 +11,8 @@ default = []
 ml = ["secguard-brain"]
 
 [dependencies]
+toml = { workspace = true }
+dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
@@ -21,4 +23,5 @@ secguard-brain = { path = "../secguard-brain", optional = true }
 
 [dev-dependencies]
 dirs = { workspace = true }
+tempfile = "3"
 
