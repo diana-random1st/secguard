@@ -63,6 +63,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Ensure rustup cargo is first in PATH
+        # macos-latest runners ship a pre-installed `cargo` that is in fact
+        # a `rustup-init` shim with no default toolchain; if it wins the PATH
+        # race against dtolnay/rust-toolchain's install, `cargo build` lands
+        # in rustup-init and dies with "unexpected argument 'build' found".
+        # Prepend the actual cargo dir explicitly so we never resolve to the
+        # shim again.
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 

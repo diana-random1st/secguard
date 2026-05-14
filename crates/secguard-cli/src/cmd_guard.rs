@@ -193,7 +193,7 @@ mod tests {
         // min_count=3 filters out psql
         let mut ranked: Vec<(String, usize)> =
             counts.into_iter().filter(|(_, c)| *c >= 3).collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].0, "diana");
         assert_eq!(ranked[1].0, "gws");

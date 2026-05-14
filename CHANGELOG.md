@@ -5,6 +5,18 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.3]
+
+### Fixed
+
+- Rust 1.95 clippy in `ast.rs`: removed four `cmd.wrappers.into_iter()` calls inside `Extend::extend` (the trait already takes any `IntoIterator`), and rewrote one `loop { let Some(...) = ... else { break; }; ... }` as `while let Some(...) = ... { ... }`. Pre-existing on 1.94 too — surfaced once CI cargo bumped to 1.95.
+- Suggest CLI test: `sort_by` rewritten as `sort_by_key` with `Reverse` (clippy `unnecessary_sort_by`).
+- Release workflow: explicit `echo "$HOME/.cargo/bin" >> $GITHUB_PATH` step after `dtolnay/rust-toolchain`. On the macos-latest runner image the pre-installed `cargo` is a `rustup-init` shim that, with no default toolchain, won races against the just-installed rustup cargo — `cargo build --target …` died with `unexpected argument 'build' found` in 0.5.1 and 0.5.2 release attempts. Prepending the rustup cargo dir to PATH explicitly is the fix.
+
+### Compatibility
+
+- 0.5.1 and 0.5.2 were never published as GitHub releases (release workflow failed before `softprops/action-gh-release` ran). The Docker image `ghcr.io/diana-random1st/secguard:0.5.2` exists but no tar.gz binaries or installer assets. Install 0.5.3 instead.
+
 ## [0.5.2]
 
 ### Fixed

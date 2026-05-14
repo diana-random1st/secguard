@@ -362,7 +362,7 @@ impl<'a> Walker<'a> {
                         for mut cmd in parse(body).commands {
                             let mut chain = wrappers.to_vec();
                             chain.push(Wrapper::Shell);
-                            chain.extend(cmd.wrappers.into_iter());
+                            chain.extend(cmd.wrappers);
                             cmd.wrappers = chain;
                             if cmd.cwd.is_none() {
                                 cmd.cwd = self.cwd.clone();
@@ -615,7 +615,7 @@ impl<'a> Walker<'a> {
                 for mut cmd in inner {
                     let mut chain = wrappers.to_vec();
                     chain.push(Wrapper::Shell);
-                    chain.extend(cmd.wrappers.into_iter());
+                    chain.extend(cmd.wrappers);
                     cmd.wrappers = chain;
                     cmd.remote = cmd.remote || remote;
                     cmd.chrooted = cmd.chrooted || chrooted;
@@ -823,7 +823,7 @@ impl<'a> Walker<'a> {
                     if !inner.is_empty() {
                         for mut cmd in inner {
                             let mut chain = wrappers.to_vec();
-                            chain.extend(cmd.wrappers.into_iter());
+                            chain.extend(cmd.wrappers);
                             cmd.wrappers = chain;
                             cmd.remote = cmd.remote || remote;
                             cmd.chrooted = cmd.chrooted || chrooted;
@@ -882,10 +882,7 @@ impl<'a> Walker<'a> {
         let mut chain: Vec<Wrapper> = wrappers.to_vec();
         let mut acc_remote = remote;
         let mut acc_chrooted = chrooted;
-        loop {
-            let Some((wrapper, inner, r, c, body)) = unwrap_wrapper(&current_argv) else {
-                break;
-            };
+        while let Some((wrapper, inner, r, c, body)) = unwrap_wrapper(&current_argv) {
             chain.push(wrapper);
             acc_remote = acc_remote || r;
             acc_chrooted = acc_chrooted || c;
@@ -923,7 +920,7 @@ impl<'a> Walker<'a> {
                 if !inner_cmds.is_empty() {
                     for mut cmd in inner_cmds {
                         let mut full_chain = chain.clone();
-                        full_chain.extend(cmd.wrappers.into_iter());
+                        full_chain.extend(cmd.wrappers);
                         cmd.wrappers = full_chain;
                         cmd.remote = cmd.remote || acc_remote;
                         cmd.chrooted = cmd.chrooted || acc_chrooted;
