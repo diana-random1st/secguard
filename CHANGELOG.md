@@ -5,6 +5,21 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.1]
+
+### Fixed
+
+- `policy.rs`: replaced manual `cmd["prefix ".len()..]` indexing with `strip_prefix` on the `terraform` and `brew` branches. Behaviour is identical for valid input but the original code could panic at runtime on an unfortunate byte slice; the new code returns `None` and falls through.
+- `ast.rs`: two `herestring_redirect` loops that immediately `break` are now plain `.next()` calls with an explicit `children` binding to keep the iterator alive long enough. Pre-existing; surfaced when CI clippy went green for the first time.
+
+### Added
+
+- End-to-end integration tests through the binary for the 0.5 features:
+  - `strict_block = false` resolved from a config file (no env var) restores the JSON `ask` path.
+  - `safe_command_prefixes` in config makes a non-built-in command (`rclone copy …`) policy-safe.
+  - `secguard guard suggest` against a synthetic telemetry file: brain-only filter, min-count gate, prefix grouping, TOML stub emission.
+  - Shadow mode parity coverage for Codex and Gemini targets (was Claude-only).
+
 ## [0.5.0]
 
 ### Added
