@@ -100,7 +100,7 @@ pub fn run_suggest(
 
     // Human-readable table
     println!("Brain-only destructive verdicts (potential false positives):");
-    println!("{:>7}  {:<30}  {}", "count", "prefix", "example");
+    println!("{:>7}  {:<30}  example", "count", "prefix");
     println!("{}", "-".repeat(80));
     for (prefix, cnt) in &ranked {
         let example = examples.get(prefix).map(|s| s.as_str()).unwrap_or("");
@@ -131,7 +131,6 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
 
     fn sample_telemetry() -> &'static str {

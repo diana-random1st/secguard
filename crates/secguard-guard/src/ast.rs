@@ -575,9 +575,9 @@ impl<'a> Walker<'a> {
                 }
                 "herestring_redirect" => {
                     let mut cur = k.walk();
-                    for inner in k.named_children(&mut cur) {
+                    let mut children = k.named_children(&mut cur);
+                    if let Some(inner) = children.next() {
                         script = Some(unquote(self.text(inner)));
-                        break;
                     }
                 }
                 "process_substitution" => {
@@ -732,9 +732,9 @@ impl<'a> Walker<'a> {
                 match child.kind() {
                     "herestring_redirect" => {
                         let mut cur = child.walk();
-                        for inner in child.named_children(&mut cur) {
+                        let mut children = child.named_children(&mut cur);
+                        if let Some(inner) = children.next() {
                             script_input = Some(unquote(self.text(inner)));
-                            break;
                         }
                     }
                     "heredoc_redirect" => {
@@ -912,7 +912,7 @@ impl<'a> Walker<'a> {
                             argv: vec!["__indirect_unresolved__".to_string(), body.clone()],
                             cwd: self.cwd.clone(),
                             span: SpanKind::Executed,
-                            wrappers: full_chain.drain(..).collect(),
+                            wrappers: std::mem::take(&mut full_chain),
                             remote: acc_remote,
                             chrooted: acc_chrooted,
                         });

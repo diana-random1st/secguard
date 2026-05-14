@@ -144,21 +144,25 @@ safe_command_prefixes = ["gws", "rclone copy", "tailscale status"]
     }
 
     #[test]
-    fn is_strict_env_override_wins_off() {
-        // Save & isolate — we use a unique value to avoid races with other tests
-        // that may run in parallel (cargo test default).
-        let mut cfg = GuardConfig::default();
-        cfg.strict_block = true;
-
-        // We cannot safely mutate env in parallel tests; assert the pure predicate
-        // by spelling out the resolution rule for representative values.
-        let raw_off = "0";
-        let v = raw_off.trim().to_ascii_lowercase();
-        assert!(v.is_empty() || v == "0" || v == "off" || v == "false");
-
-        let raw_on = "1";
-        let v = raw_on.trim().to_ascii_lowercase();
-        assert!(!(v.is_empty() || v == "0" || v == "off" || v == "false"));
+    fn is_strict_env_value_recognises_off_and_on() {
+        // Env predicate is identical to SECGUARD_SHADOW: 0/off/false/empty = off,
+        // anything else = on. We cannot mutate env in parallel tests safely;
+        // assert the pure rule against representative inputs. The end-to-end
+        // env-var path is exercised by tests/cli.rs against the binary.
+        for off in ["0", "off", "false", "OFF", "", "  ", " false "] {
+            let v = off.trim().to_ascii_lowercase();
+            assert!(
+                v.is_empty() || v == "0" || v == "off" || v == "false",
+                "expected off for {off:?}"
+            );
+        }
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            let v = on.trim().to_ascii_lowercase();
+            assert!(
+                !(v.is_empty() || v == "0" || v == "off" || v == "false"),
+                "expected on for {on:?}"
+            );
+        }
     }
 
     #[test]

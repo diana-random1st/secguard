@@ -50,8 +50,7 @@ fn is_single_command_safe(cmd: &str, config: &GuardConfig) -> bool {
         return true;
     }
     // diana CLI — safe unless the rest contains " rm " or "delete"
-    if cmd.starts_with("diana ") {
-        let rest = &cmd["diana ".len()..];
+    if let Some(rest) = cmd.strip_prefix("diana ") {
         return !rest.contains(" rm ") && !rest.contains("delete");
     }
     // psql DB client — safe for read/query use; reject if command contains
@@ -73,7 +72,7 @@ fn is_single_command_safe(cmd: &str, config: &GuardConfig) -> bool {
         return !has_destructive_sql;
     }
     // terraform — only read/inspect subcommands are safe
-    if cmd.starts_with("terraform ") {
+    if let Some(rest) = cmd.strip_prefix("terraform ") {
         let safe_subs = [
             "plan",
             "show",
@@ -84,17 +83,17 @@ fn is_single_command_safe(cmd: &str, config: &GuardConfig) -> bool {
             "fmt",
             "version",
         ];
-        let rest = cmd["terraform ".len()..].trim_start();
+        let rest = rest.trim_start();
         return safe_subs
             .iter()
             .any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
     }
     // brew — only read/install subcommands are safe; uninstall/cleanup are destructive
-    if cmd.starts_with("brew ") {
+    if let Some(rest) = cmd.strip_prefix("brew ") {
         let safe_subs = [
             "install", "upgrade", "list", "info", "search", "update", "outdated", "tap", "leaves",
         ];
-        let rest = cmd["brew ".len()..].trim_start();
+        let rest = rest.trim_start();
         return safe_subs
             .iter()
             .any(|s| rest == *s || rest.starts_with(&format!("{s} ")));

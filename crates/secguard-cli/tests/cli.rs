@@ -643,3 +643,156 @@ fn help_lists_update_subcommand() {
         .success()
         .stdout(predicate::str::contains("update"));
 }
+
+// ── 0.5 end-to-end: config-driven strict + prefixes, suggest CLI ──────────
+
+#[test]
+fn hook_guard_strict_block_false_via_config_file() {
+    use std::io::Write;
+    // strict_block=false in config file must restore the pre-0.5 JSON-ask
+    // path even when SECGUARD_STRICT env var is unset. Pinning the resolution
+    // through SECGUARD_CONFIG keeps the test hermetic — no dependency on
+    // whatever sits in the runner's ~/.config/secguard/config.toml.
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    writeln!(tmp, "strict_block = false").unwrap();
+
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .env("SECGUARD_CONFIG", tmp.path())
+        .env("SECGUARD_TELEMETRY", "off")
+        .env_remove("SECGUARD_STRICT")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("permissionDecision"))
+        .stdout(predicate::str::contains("ask"));
+}
+
+#[test]
+fn hook_guard_user_prefix_from_config_makes_safe() {
+    use std::io::Write;
+    // safe_command_prefixes in the user config must be honoured end-to-end:
+    // the heuristic/brain pipeline never gets the command because policy
+    // short-circuits to Safe. `rclone copy` is not in the built-in allowlist,
+    // so without config this would land in the brain phase. A `Safe` verdict
+    // produces no stdout regardless of strict_block — same allow path as the
+    // built-in `gws`/`diana` prefixes.
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    writeln!(tmp, r#"safe_command_prefixes = ["rclone copy"]"#).unwrap();
+
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "rclone copy /tmp/src /tmp/dst" }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .env("SECGUARD_CONFIG", tmp.path())
+        .env("SECGUARD_TELEMETRY", "off")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn guard_suggest_against_sample_telemetry() {
+    use std::io::Write;
+    // Construct a synthetic telemetry stream where two prefixes meet the
+    // min-count threshold (`echo` ×5, `kubectl` ×3) and one falls below
+    // (`tail` ×2). Also feed two noise lines that must be filtered out:
+    // a heuristic-source destructive (the deterministic phase already
+    // catches it — not a tuning candidate) and a brain-source safe (not
+    // destructive at all).
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    for _ in 0..5 {
+        writeln!(
+            tmp,
+            r#"{{"ts":"2026-05-14T00:00:00Z","mode":"guard","tool_name":"Bash","command":"echo foo bar","verdict":"destructive","verdict_source":"brain","reason":null,"confidence":0.92,"latency_us":500,"target":"claude"}}"#
+        )
+        .unwrap();
+    }
+    for _ in 0..3 {
+        writeln!(
+            tmp,
+            r#"{{"ts":"2026-05-14T00:00:00Z","mode":"guard","tool_name":"Bash","command":"kubectl delete pod x","verdict":"destructive","verdict_source":"brain","reason":null,"confidence":0.96,"latency_us":500,"target":"claude"}}"#
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        writeln!(
+            tmp,
+            r#"{{"ts":"2026-05-14T00:00:00Z","mode":"guard","tool_name":"Bash","command":"tail -f /var/log/x","verdict":"destructive","verdict_source":"brain","reason":null,"confidence":0.88,"latency_us":500,"target":"claude"}}"#
+        )
+        .unwrap();
+    }
+    writeln!(
+        tmp,
+        r#"{{"ts":"2026-05-14T00:00:00Z","mode":"guard","tool_name":"Bash","command":"rm -rf /","verdict":"destructive","verdict_source":"heuristic","reason":null,"confidence":null,"latency_us":50,"target":"claude"}}"#
+    )
+    .unwrap();
+    writeln!(
+        tmp,
+        r#"{{"ts":"2026-05-14T00:00:00Z","mode":"guard","tool_name":"Bash","command":"ls","verdict":"safe","verdict_source":"brain","reason":null,"confidence":0.99,"latency_us":300,"target":"claude"}}"#
+    )
+    .unwrap();
+
+    secguard()
+        .args([
+            "guard",
+            "suggest",
+            "--min-count",
+            "3",
+            "--top",
+            "10",
+            "--telemetry",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo"))
+        .stdout(predicate::str::contains("kubectl"))
+        .stdout(predicate::str::contains("tail").not())
+        .stdout(predicate::str::contains("rm").not())
+        .stdout(predicate::str::contains("safe_command_prefixes"));
+}
+
+#[test]
+fn hook_guard_shadow_codex_does_not_block() {
+    // Parity check with Claude shadow: Codex target in shadow mode must log
+    // the would-be decision on stderr instead of denying the command.
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard", "--target", "codex"])
+        .env("SECGUARD_SHADOW", "1")
+        .env("SECGUARD_TELEMETRY", "off")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[secguard][shadow]"));
+}
+
+#[test]
+fn hook_guard_shadow_gemini_does_not_block() {
+    let input = serde_json::json!({
+        "hook_event_name": "BeforeTool",
+        "tool_name": "run_shell_command",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard", "--target", "gemini"])
+        .env("SECGUARD_SHADOW", "1")
+        .env("SECGUARD_TELEMETRY", "off")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("[secguard][shadow]"));
+}
