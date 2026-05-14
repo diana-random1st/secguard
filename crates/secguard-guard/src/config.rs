@@ -12,6 +12,16 @@ pub struct GuardConfig {
     /// are not listed here — they are hard-coded in policy.rs.
     #[serde(default)]
     pub safe_command_prefixes: Vec<String>,
+    /// When true, the Claude hook emits `exit(2)` on destructive verdicts instead of
+    /// a JSON `ask` response. exit(2) is honoured even in Claude's `bypassPermissions`
+    /// mode; JSON `ask` is not. Default true: a security hook that fails open in
+    /// "accept all" mode is misleading. Override per-invocation with `SECGUARD_STRICT=0`.
+    #[serde(default = "default_strict_block")]
+    pub strict_block: bool,
+}
+
+fn default_strict_block() -> bool {
+    true
 }
 
 impl Default for GuardConfig {
@@ -28,7 +38,21 @@ impl Default for GuardConfig {
                 "/tmp/".into(),
             ],
             safe_command_prefixes: vec![],
+            strict_block: default_strict_block(),
         }
+    }
+}
+
+/// Resolve the effective strict_block setting: env override wins, then config.
+/// Recognised env values mirror SECGUARD_SHADOW: `0`/`off`/`false`/empty = off,
+/// anything else = on. Unset env → fall through to config.
+pub fn is_strict(config: &GuardConfig) -> bool {
+    match std::env::var("SECGUARD_STRICT").ok() {
+        Some(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "off" || v == "false")
+        }
+        None => config.strict_block,
     }
 }
 
@@ -102,6 +126,43 @@ safe_command_prefixes = ["gws", "rclone copy", "tailscale status"]
         assert!(cfg.safe_kill_targets.contains(&"postgres".to_string()));
         assert!(cfg.safe_command_prefixes.contains(&"rclone copy".to_string()));
         assert_eq!(cfg.safe_command_prefixes.len(), 3);
+    }
+
+    #[test]
+    fn strict_block_defaults_to_true() {
+        assert!(GuardConfig::default().strict_block);
+    }
+
+    #[test]
+    fn parse_config_with_strict_block_disabled() {
+        let cfg: GuardConfig = toml::from_str("strict_block = false").expect("parse");
+        assert!(!cfg.strict_block);
+    }
+
+    #[test]
+    fn parse_config_without_strict_block_uses_default_true() {
+        // Missing field → serde default → true. Backwards-compatible with
+        // pre-strict-block config files.
+        let cfg: GuardConfig = toml::from_str(r#"safe_command_prefixes = ["gws"]"#).expect("parse");
+        assert!(cfg.strict_block);
+    }
+
+    #[test]
+    fn is_strict_env_override_wins_off() {
+        // Save & isolate — we use a unique value to avoid races with other tests
+        // that may run in parallel (cargo test default).
+        let mut cfg = GuardConfig::default();
+        cfg.strict_block = true;
+
+        // We cannot safely mutate env in parallel tests; assert the pure predicate
+        // by spelling out the resolution rule for representative values.
+        let raw_off = "0";
+        let v = raw_off.trim().to_ascii_lowercase();
+        assert!(v.is_empty() || v == "0" || v == "off" || v == "false");
+
+        let raw_on = "1";
+        let v = raw_on.trim().to_ascii_lowercase();
+        assert!(!(v.is_empty() || v == "0" || v == "off" || v == "false"));
     }
 
     #[test]

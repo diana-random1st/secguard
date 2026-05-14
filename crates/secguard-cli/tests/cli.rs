@@ -202,13 +202,34 @@ fn hook_guard_safe_bash() {
 }
 
 #[test]
-fn hook_guard_destructive_bash() {
+fn hook_guard_destructive_bash_strict_exit_2() {
+    // Default config has strict_block = true and default target = Claude, so a
+    // destructive verdict must hard-block via exit(2) — bypassPermissions-safe.
+    // The reason still surfaces on stderr for human visibility. JSON ask on
+    // stdout is intentionally suppressed in strict mode.
     let input = serde_json::json!({
         "tool_name": "Bash",
         "tool_input": { "command": "rm -rf /" }
     });
     secguard()
         .args(["hook", "guard"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Destructive"));
+}
+
+#[test]
+fn hook_guard_destructive_bash_non_strict_emits_ask() {
+    // SECGUARD_STRICT=0 restores the pre-0.5 JSON-ask behaviour.
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+    });
+    secguard()
+        .args(["hook", "guard"])
+        .env("SECGUARD_STRICT", "0")
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
@@ -258,7 +279,8 @@ fn hook_guard_shadow_mode_safe_command_silent() {
 
 #[test]
 fn hook_guard_shadow_mode_off_value_disables() {
-    // SECGUARD_SHADOW=off must NOT enable shadow mode; behaviour stays normal.
+    // SECGUARD_SHADOW=off must NOT enable shadow mode; behaviour stays normal,
+    // which in 0.5+ means strict block (exit 2) on the default Claude target.
     let input = serde_json::json!({
         "tool_name": "Bash",
         "tool_input": { "command": "rm -rf /" }
@@ -269,9 +291,8 @@ fn hook_guard_shadow_mode_off_value_disables() {
         .env("SECGUARD_TELEMETRY", "off")
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
-        .success()
-        .stdout(predicate::str::contains("permissionDecision"))
-        .stdout(predicate::str::contains("ask"));
+        .code(2)
+        .stderr(predicate::str::contains("Destructive"));
 }
 
 #[test]
@@ -285,13 +306,14 @@ fn hook_guard_long_unicode_command_does_not_panic() {
         .args(["hook", "guard"])
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
-        .success()
-        .stdout(predicate::str::contains("permissionDecision"))
-        .stdout(predicate::str::contains("ask"));
+        .code(2)
+        .stderr(predicate::str::contains("Destructive"));
 }
 
 #[test]
 fn hook_guard_destructive_warning_redacts_secret() {
+    // Strict mode emits to stderr only; the redaction guarantee applies to
+    // whichever stream the reason lands in.
     let key = format!("AKIA{}", "IOSFODNN7EXAMPLE");
     let input = serde_json::json!({
         "tool_name": "Bash",
@@ -301,22 +323,23 @@ fn hook_guard_destructive_warning_redacts_secret() {
         .args(["hook", "guard"])
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
-        .success()
-        .stdout(predicate::str::contains("[REDACTED:aws_access_key]"))
-        .stdout(predicate::str::contains(key.clone()).not())
+        .code(2)
         .stderr(predicate::str::contains("[REDACTED:aws_access_key]"))
         .stderr(predicate::str::contains(key).not());
 }
 
 #[test]
 fn hook_guard_destructive_gemini_shell() {
+    // Gemini target keeps the JSON `ask` semantics; strict-mode exit(2) is
+    // Claude-only. The pre-0.5 test omitted `--target gemini` and relied on
+    // Claude's old JSON-ask path masquerading as Gemini behaviour.
     let input = serde_json::json!({
         "hook_event_name": "BeforeTool",
         "tool_name": "run_shell_command",
         "tool_input": { "command": "rm -rf /" }
     });
     secguard()
-        .args(["hook", "guard"])
+        .args(["hook", "guard", "--target", "gemini"])
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()

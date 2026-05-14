@@ -109,9 +109,9 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let config = secguard_guard::config::load();
     let start = std::time::Instant::now();
-    let detail =
-        secguard_guard::check_detailed(&text_to_check, &secguard_guard::config::load());
+    let detail = secguard_guard::check_detailed(&text_to_check, &config);
     let latency_us = start.elapsed().as_micros();
 
     let (verdict_str, reason) = match &detail.verdict {
@@ -165,6 +165,14 @@ fn run_guard(v: &serde_json::Value, target: HookTarget) -> anyhow::Result<()> {
 
         let reason_text = format!("\u{26a0}\u{fe0f} Destructive: {reason}\nCommand: {display}");
         eprintln!("[secguard] {reason_text}");
+
+        // Claude's `bypassPermissions` mode ignores hook JSON `ask`/`deny` but
+        // honours exit(2). Strict mode (default) exits 2 so the block holds in
+        // every permission mode. Codex/Gemini have their own deny semantics —
+        // they keep the JSON response unchanged.
+        if matches!(target, HookTarget::Claude) && secguard_guard::config::is_strict(&config) {
+            std::process::exit(2);
+        }
 
         let hook_event_name = incoming_hook_event_name(v);
         let json = deny_response(target, hook_event_name, reason_text);

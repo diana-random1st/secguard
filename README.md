@@ -224,6 +224,53 @@ Recognised off values: `0`, `off`, `false`, empty, unset. Anything else (`1`, `t
 
 **Scope.** Shadow mode is honoured by the `secguard` CLI's hook handler (Claude Code, Gemini CLI, Codex CLI integrations). The `secguard-server` HTTP variant ignores it: server deployments are typically central choke points where opaque fail-open is undesirable. If you need observe-only behavior in the server, scope it per-deployment via reverse proxy or a dedicated route.
 
+## Strict block mode
+
+For the Claude Code target, secguard defaults to a **hard block** on destructive verdicts: the hook exits with code `2` instead of emitting JSON `{"decision":"ask"}`. Reason — Claude's `bypassPermissions` mode (the "accept all" / yolo toggle) ignores hook JSON decisions but honours `exit(2)`. A security hook that fails open in accept-all mode is misleading, so strict is the safer default.
+
+Opt out per-config (gives back the approve-via-prompt UX):
+
+```toml
+# ~/.config/secguard/config.toml
+strict_block = false
+```
+
+Or per-invocation:
+
+```bash
+SECGUARD_STRICT=0 claude  # JSON ask, can be approved interactively
+```
+
+Codex and Gemini targets are unaffected — they keep their own `deny` semantics distinct from Claude's `ask`.
+
+## User config
+
+Optional file at `~/.config/secguard/config.toml` (override the path with `SECGUARD_CONFIG=/path/to/file.toml`):
+
+```toml
+# Process names that pkill / killall may target safely.
+safe_kill_targets = ["node", "python", "postgres"]
+
+# Extra command prefixes treated as safe-by-policy, in addition to the
+# built-in allowlist (gws, diana, psql, terraform plan/show/output,
+# brew install/upgrade/list/info, cargo/npm/bun/yarn/pnpm/pip/uv
+# build/check/test/install/ci/add/sync, etc.).
+safe_command_prefixes = ["rclone copy", "tailscale status"]
+
+# See "Strict block mode" — default true.
+strict_block = true
+```
+
+Parse errors fall back to defaults with a stderr warning; secguard never panics on a malformed config.
+
+To data-drive allowlist additions, run:
+
+```bash
+secguard guard suggest --top 20 --min-count 3
+```
+
+It reads `~/.secguard/telemetry.jsonl`, picks the brain-only `destructive` verdicts (i.e. the false-positive candidates the deterministic rules didn't catch), groups by command prefix, and prints a paste-ready `safe_command_prefixes = [...]` block.
+
 ## Standalone usage
 
 ```bash
