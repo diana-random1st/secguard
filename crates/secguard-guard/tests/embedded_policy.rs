@@ -332,7 +332,9 @@ fn output_resolution_checks_existing_ancestors_and_directory_destinations() {
     for command in [
         "echo sample > alias/new/settings",
         "cp sample alias",
+        "cp sample alias -f",
         "install -t alias sample",
+        "install -vtalias sample",
         "ln --target-directory=alias sample",
         "chmod -R u+rw alias",
         "chown --recursive fixture alias",
@@ -349,4 +351,5 @@ fn output_resolution_checks_existing_ancestors_and_directory_destinations() {
     assert_eq!(check("echo sample > safe/settings").action, Action::Allow);
     assert_eq!(check("rg sample .").action, Action::Allow);
     assert_eq!(check("cp alias safe").action, Action::Allow);
+    assert_eq!(check("cp -t safe sample").action, Action::Allow);
 }

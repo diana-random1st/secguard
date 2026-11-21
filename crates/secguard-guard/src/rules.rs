@@ -124,13 +124,18 @@ pub(crate) fn classify_self_approval(
                 });
 
         for (index, operand) in command.args().iter().enumerate() {
+            let destination = directory_destination.filter(|(position, _)| *position == index);
             // Programs also accept paths supplied as --option=path.
-            let operand = operand
-                .strip_prefix('-')
-                .and_then(|flag| flag.split_once('='))
-                .map_or(operand.as_str(), |(_, path)| path);
+            let operand = if let Some((_, path)) = destination {
+                path
+            } else {
+                operand
+                    .strip_prefix('-')
+                    .and_then(|flag| flag.split_once('='))
+                    .map_or(operand.as_str(), |(_, path)| path)
+            };
             let affects_children =
-                writes_directories || recursive_metadata || directory_destination == Some(index);
+                writes_directories || recursive_metadata || destination.is_some();
             match protected_policy_path(operand, command.cwd.as_deref(), config, affects_children) {
                 Ok(true) => {
                     return Some((
@@ -164,22 +169,50 @@ pub(crate) fn classify_self_approval(
 /// Only these modeled writers have a destination operand that can affect a child.
 /// A directory destination is checked conservatively rather than predicting the
 /// utility's copy/link semantics. Arbitrary programs and scripts are not modeled.
-fn directory_destination(head: Option<&str>, args: &[String]) -> Option<usize> {
+fn directory_destination<'a>(head: Option<&str>, args: &'a [String]) -> Option<(usize, &'a str)> {
     if !matches!(head, Some("cp" | "install" | "ln")) {
         return None;
     }
-    for (index, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        if arg == "-t" || arg == "--target-directory" {
-            return Some(index + 1);
-        }
-        if arg.starts_with("--target-directory=") {
-            return Some(index);
+    let mut positional = None;
+    let mut options = true;
+    let mut args = args.iter().map(String::as_str).enumerate();
+    while let Some((index, arg)) = args.next() {
+        if !options || !arg.starts_with('-') || arg == "-" {
+            positional = Some((index, arg));
+        } else if arg == "--" {
+            options = false;
+        } else if let Some(flag) = arg.strip_prefix("--") {
+            let (name, value) = flag
+                .split_once('=')
+                .map_or((flag, None), |(name, value)| (name, Some(value)));
+            if !name.is_empty() && "target-directory".starts_with(name) {
+                return value.map(|value| (index, value)).or_else(|| args.next());
+            }
+            if value.is_none()
+                && matches!(
+                    name,
+                    "suffix" | "group" | "mode" | "owner" | "strip-program"
+                )
+            {
+                args.next();
+            }
+        } else if let Some((offset, flag)) = arg.char_indices().find(|(_, flag)| {
+            matches!(flag, 'S' | 't') || head == Some("install") && matches!(flag, 'g' | 'm' | 'o')
+        }) {
+            let value = &arg[offset + 1..];
+            if flag == 't' {
+                return if value.is_empty() {
+                    args.next()
+                } else {
+                    Some((index, value))
+                };
+            }
+            if value.is_empty() {
+                args.next();
+            }
         }
     }
-    args.len().checked_sub(1)
+    positional
 }
 
 fn protected_policy_path(
