@@ -94,6 +94,9 @@ pub struct GuardConfig {
     /// Indirect prompt-injection detection.
     #[serde(default)]
     pub injection: InjectionConfig,
+    /// Additional absolute policy files or directories supplied by the trusted host.
+    #[serde(skip)]
+    pub protected_policy_paths: Vec<std::path::PathBuf>,
 }
 
 /// Per-cell overrides for the blast × reversibility action matrix.
@@ -203,6 +206,7 @@ impl Default for GuardConfig {
             autostash: AutostashConfig::default(),
             lockdown: LockdownConfig::default(),
             injection: InjectionConfig::default(),
+            protected_policy_paths: Vec::new(),
         }
     }
 }

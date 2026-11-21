@@ -226,3 +226,90 @@ action = "allow"
     assert_eq!(detail.action, Action::Block);
     assert!(!detail.can_approve());
 }
+
+#[test]
+fn protected_writes_use_parsed_targets_and_the_action_directory() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    let cwd = Path::new("/fixture");
+    for command in [
+        "git restore -- 'policy dir/settings.toml'",
+        "printf ok > 'policy dir/settings.toml'",
+        "bash -c 'printf ok > \"policy dir/settings.toml\"'",
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(command, &config, cwd);
+        assert_eq!(detail.rule_id, Some(RuleId::GuardSelfApproval), "{command}");
+        assert!(!detail.can_approve());
+    }
+    assert_eq!(
+        secguard_guard::check_detailed_in_dir("cat 'policy dir/settings.toml'", &config, cwd)
+            .action,
+        Action::Allow
+    );
+    for command in ["rg fixture .", "secguard allow --help"] {
+        assert_eq!(
+            secguard_guard::check_detailed_in_dir(command, &config, cwd).action,
+            Action::Allow,
+            "{command}",
+        );
+    }
+    let detail =
+        secguard_guard::check_detailed_in_dir("printf ok > \"$OUTPUT_PATH\"", &config, cwd);
+    assert_eq!(detail.action, Action::Block);
+    assert!(!detail.determinate);
+}
+
+#[test]
+fn prefix_allow_requires_a_literal_unwrapped_shell_invocation() {
+    use std::path::Path;
+
+    let config: GuardConfig = toml::from_str(
+        r#"
+[[allow.commands]]
+id = "clean-fixture"
+type = "command_prefix"
+pattern = "git clean"
+"#,
+    )
+    .unwrap();
+
+    let check =
+        |command| secguard_guard::check_detailed_in_dir(command, &config, Path::new("/fixture"));
+    assert_eq!(
+        check("git clean -f").policy_rule_id.as_deref(),
+        Some("clean-fixture")
+    );
+    assert_eq!(
+        check("git clean -f > output.log").rule_id,
+        Some(RuleId::GitCleanForce)
+    );
+    let expanded = check("git clean -f \"$NAME\"");
+    assert_eq!(expanded.action, Action::Block);
+    assert!(!expanded.determinate);
+    let unsupported = check("while false; do echo test; done");
+    assert_eq!(unsupported.action, Action::Block);
+    assert!(!unsupported.determinate);
+}
+
+#[test]
+fn account_roots_and_directory_removal_cannot_be_approved_as_file_deletion() {
+    let config = GuardConfig::default();
+    for command in [
+        "rm /home/fixture",
+        "rm -d /Users/fixture/folder",
+        "rm --dir /home/fixture/folder",
+        "rm /home/fixture/folder/",
+    ] {
+        let detail = check_detailed(command, &config);
+        assert_eq!(detail.rule_id, Some(RuleId::RmRf), "{command}");
+        assert!(!detail.can_approve());
+    }
+    assert_eq!(
+        check_detailed("rm /home/fixture/file.txt", &config).rule_id,
+        Some(RuleId::RmTargetedFile)
+    );
+}

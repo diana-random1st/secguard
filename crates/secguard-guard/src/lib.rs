@@ -258,12 +258,15 @@ fn check_detailed_inner(
     {
         return VerdictDetail::unavailable("guard could not parse the action", config);
     }
+    let raw_allow_eligible = parsed.raw_allow_eligible;
     let commands = parsed.commands;
     let had_parse_issue = parsed.had_error;
 
     // Granting guard permission is human-only. Runs before every allow path
     // (config allows, the `diana ...` policy shortcut) and is never exempt.
-    if let Some((rule_id, reason)) = rules::classify_self_approval(&commands, cmd) {
+    if let Some((rule_id, reason)) =
+        rules::classify_self_approval(&commands, config, cwd.is_some() || config.lockdown.enabled)
+    {
         return VerdictDetail::new(
             Verdict::Destructive(reason),
             VerdictSource::Heuristic,
@@ -302,15 +305,19 @@ fn check_detailed_inner(
         );
     }
 
+    if (cwd.is_some() || exempt.is_some() || config.lockdown.enabled)
+        && commands
+            .iter()
+            .any(|command| command.head() == Some("__shell_unmodeled__"))
+    {
+        return VerdictDetail::unavailable("guard could not model the shell action", config);
+    }
+
     // A config allow rule matches the raw string, so it may only vouch for a
     // single simple command: `command_prefix "git status"` must not wave
     // through `git status && rm -rf ~`. Compound, piped, substituted or
     // unparseable input goes through the per-command rules instead.
-    let executed = commands
-        .iter()
-        .filter(|ec| ec.span == ast::SpanKind::Executed)
-        .count();
-    if executed == 1 && !had_parse_issue {
+    if raw_allow_eligible && !had_parse_issue {
         match matcher::evaluate(cmd, &[], &lists.allow.commands) {
             matcher::Decision::Allow { rule_id, .. } => {
                 let mut detail =
@@ -322,7 +329,7 @@ fn check_detailed_inner(
         }
     }
 
-    if !had_parse_issue && policy::is_safe_by_policy(cmd, config) {
+    if raw_allow_eligible && !had_parse_issue && policy::is_safe_by_policy(cmd, config) {
         return VerdictDetail::new(Verdict::Safe, VerdictSource::Policy, None, None, config);
     }
 

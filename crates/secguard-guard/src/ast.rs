@@ -100,6 +100,7 @@ impl EffectiveCommand {
 pub struct ParseResult {
     pub commands: Vec<EffectiveCommand>,
     pub had_error: bool,
+    pub(crate) raw_allow_eligible: bool,
 }
 
 /// Parse a raw bash command. Always returns a list of commands (possibly
@@ -117,12 +118,14 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
         return ParseResult {
             commands: Vec::new(),
             had_error: true,
+            raw_allow_eligible: false,
         };
     }
     let Some(tree) = parser.parse(source, None) else {
         return ParseResult {
             commands: Vec::new(),
             had_error: true,
+            raw_allow_eligible: false,
         };
     };
 
@@ -131,9 +134,51 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
     walker.cwd = cwd.map(str::to_owned);
     walker.walk_program(tree.root_node());
 
+    let root = tree.root_node();
+    let raw_allow_eligible = root.named_child_count() == 1
+        && root
+            .named_child(0)
+            .is_some_and(|node| simple_literal_command(node, bytes))
+        && walker.commands.len() == 1
+        && walker.commands[0].wrappers.is_empty();
+
     ParseResult {
+        raw_allow_eligible,
         commands: walker.commands,
         had_error: tree_has_error(&tree),
+    }
+}
+
+/// A raw allow vouches for exactly one unwrapped, literal shell invocation.
+fn simple_literal_command(node: Node<'_>, bytes: &[u8]) -> bool {
+    if node.kind() != "command" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let simple = node
+        .named_children(&mut cursor)
+        .all(|child| match child.kind() {
+            "command_name" => child.named_child(0).is_some_and(|n| literal_node(n, bytes)),
+            _ => literal_node(child, bytes),
+        });
+    simple
+}
+
+fn literal_node(node: Node<'_>, bytes: &[u8]) -> bool {
+    match node.kind() {
+        "raw_string" | "number" => true,
+        "word" => !node
+            .utf8_text(bytes)
+            .unwrap_or("")
+            .contains(['*', '?', '[', '{', '$', '`', '~']),
+        "string" => {
+            let mut cursor = node.walk();
+            let static_text = node
+                .named_children(&mut cursor)
+                .all(|n| n.kind() == "string_content");
+            static_text
+        }
+        _ => false,
     }
 }
 
@@ -230,6 +275,20 @@ impl<'a> Walker<'a> {
             "command" => {
                 self.handle_command(node, wrappers, remote, chrooted);
             }
+            "file_redirect" => {
+                self.handle_file_redirect(node, wrappers, remote, chrooted);
+            }
+            "for_statement"
+            | "c_style_for_statement"
+            | "while_statement"
+            | "if_statement"
+            | "case_statement"
+            | "arithmetic_expansion"
+            | "declaration_command"
+            | "unset_command" => {
+                self.push_shell_effect("__shell_unmodeled__", None, wrappers, remote, chrooted);
+                self.walk_named_children(node, wrappers, remote, chrooted);
+            }
             "pipeline" => {
                 self.handle_pipeline(node, wrappers, remote, chrooted);
             }
@@ -246,6 +305,9 @@ impl<'a> Walker<'a> {
             | "command_substitution"
             | "process_substitution"
             | "function_definition" => {
+                if node.kind() == "function_definition" {
+                    self.push_shell_effect("__shell_unmodeled__", None, wrappers, remote, chrooted);
+                }
                 // All four create a new shell scope in real bash:
                 //   * `(...)`: subshell with isolated vars + cwd.
                 //   * `$(...)` / `<(...)`: command/process substitution
@@ -282,6 +344,7 @@ impl<'a> Walker<'a> {
                 // tribunal v2 (Codex finding 4). Record `__TAINTED__`
                 // so `lookup` returns None and the envelope routes
                 // to the unresolved marker.
+                self.walk_named_children(node, wrappers, remote, chrooted);
                 let raw = self.text(node);
                 if let Some((name, value)) = parse_assignment(raw) {
                     self.bindings.insert(name, value);
@@ -292,7 +355,10 @@ impl<'a> Walker<'a> {
                 }
             }
             // Heredocs and comments are pure data — never executable.
-            "heredoc_redirect" | "comment" => {}
+            "heredoc_redirect" => {
+                self.walk_named_children(node, wrappers, remote, chrooted);
+            }
+            "comment" => {}
             // String nodes ARE data overall (their text content is not
             // executed) but they may CONTAIN command substitutions
             // (`"$(rm -rf /)"`) that DO execute before the outer
@@ -523,6 +589,65 @@ impl<'a> Walker<'a> {
     }
 
     /// Process `bash <<EOF…EOF` and friends. Tree-sitter wraps the
+    fn push_shell_effect(
+        &mut self,
+        kind: &str,
+        target: Option<String>,
+        wrappers: &[Wrapper],
+        remote: bool,
+        chrooted: bool,
+    ) {
+        let mut argv = vec![kind.to_owned()];
+        argv.extend(target);
+        self.commands.push(EffectiveCommand {
+            argv,
+            cwd: self.cwd.clone(),
+            span: SpanKind::Executed,
+            wrappers: wrappers.to_vec(),
+            remote,
+            chrooted,
+        });
+    }
+
+    fn handle_file_redirect(
+        &mut self,
+        node: Node<'_>,
+        wrappers: &[Wrapper],
+        remote: bool,
+        chrooted: bool,
+    ) {
+        self.walk_named_children(node, wrappers, remote, chrooted);
+        let mut cursor = node.walk();
+        let output = node
+            .children(&mut cursor)
+            .find_map(|child| match child.kind() {
+                ">" | ">>" | ">|" | "&>" | "&>>" => Some(false),
+                ">&" => Some(true),
+                _ => None,
+            });
+        let Some(duplication_or_output) = output else {
+            return;
+        };
+        let mut cursor = node.walk();
+        let destination = node
+            .children_by_field_name("destination", &mut cursor)
+            .next();
+        let Some(destination) = destination else {
+            self.push_shell_effect("__shell_output__", None, wrappers, remote, chrooted);
+            return;
+        };
+        let raw = self.text(destination);
+        if duplication_or_output && (raw == "-" || raw.bytes().all(|b| b.is_ascii_digit())) {
+            return;
+        }
+        let target = literal_node(destination, self.src)
+            .then(|| shell_words::split(raw).ok())
+            .flatten()
+            .filter(|words| words.len() == 1)
+            .and_then(|mut words| words.pop());
+        self.push_shell_effect("__shell_output__", target, wrappers, remote, chrooted);
+    }
+
     /// command + redirect pair as `redirected_statement` with the
     /// command and one or more redirect nodes as siblings. If the
     /// inner command's head is a shell and there is a heredoc body,
@@ -545,6 +670,12 @@ impl<'a> Walker<'a> {
             self.walk_named_children(node, wrappers, remote, chrooted);
             return;
         };
+        for &effect in kids
+            .iter()
+            .filter(|n| matches!(n.kind(), "file_redirect" | "heredoc_redirect"))
+        {
+            self.walk_node(effect, wrappers, remote, chrooted);
+        }
         // Determine the command head — needed to decide if we should
         // splice a synthetic `-c body`. Cheap argv peek via command_argv.
         let head_argv = self.command_argv(cmd_node);
@@ -616,7 +747,11 @@ impl<'a> Walker<'a> {
                 String::new()
             });
             if !body_to_parse.is_empty() {
-                let inner = parse(&body_to_parse).commands;
+                let parsed = parse_with_cwd(&body_to_parse, self.cwd.as_deref());
+                if parsed.had_error {
+                    self.push_shell_effect("__shell_unmodeled__", None, wrappers, remote, chrooted);
+                }
+                let inner = parsed.commands;
                 for mut cmd in inner {
                     let mut chain = wrappers.to_vec();
                     chain.push(Wrapper::Shell);
@@ -653,7 +788,8 @@ impl<'a> Walker<'a> {
         // and must therefore be classified independently.
         for child in &children {
             match child.kind() {
-                "command_substitution" | "process_substitution" => {
+                "file_redirect" => self.handle_file_redirect(*child, wrappers, remote, chrooted),
+                "command_substitution" | "process_substitution" | "variable_assignment" => {
                     self.walk_named_children(*child, wrappers, remote, chrooted);
                 }
                 "string" | "raw_string" | "concatenation" => {
@@ -824,7 +960,17 @@ impl<'a> Walker<'a> {
             let joined = argv.join(" ");
             match self.expand_vars(&joined) {
                 Some(expanded) if expanded != joined => {
-                    let inner = parse(&expanded).commands;
+                    let parsed = parse_with_cwd(&expanded, self.cwd.as_deref());
+                    if parsed.had_error {
+                        self.push_shell_effect(
+                            "__shell_unmodeled__",
+                            None,
+                            wrappers,
+                            remote,
+                            chrooted,
+                        );
+                    }
+                    let inner = parsed.commands;
                     if !inner.is_empty() {
                         for mut cmd in inner {
                             let mut chain = wrappers.to_vec();
@@ -921,7 +1067,17 @@ impl<'a> Walker<'a> {
                         return;
                     }
                 };
-                let inner_cmds = parse(&body_to_parse).commands;
+                let parsed = parse_with_cwd(&body_to_parse, self.cwd.as_deref());
+                if parsed.had_error {
+                    self.push_shell_effect(
+                        "__shell_unmodeled__",
+                        None,
+                        &chain,
+                        acc_remote,
+                        acc_chrooted,
+                    );
+                }
+                let inner_cmds = parsed.commands;
                 if !inner_cmds.is_empty() {
                     for mut cmd in inner_cmds {
                         let mut full_chain = chain.clone();
@@ -949,6 +1105,20 @@ impl<'a> Walker<'a> {
             current_argv = inner;
         }
 
+        if current_argv.first().is_some_and(|head| {
+            matches!(
+                head.rsplit('/').next().unwrap_or(head),
+                "bash" | "sh" | "zsh" | "ksh" | "dash"
+            )
+        }) {
+            self.push_shell_effect(
+                "__shell_unmodeled__",
+                None,
+                &chain,
+                acc_remote,
+                acc_chrooted,
+            );
+        }
         self.commands.push(EffectiveCommand {
             argv: current_argv,
             cwd: self.cwd.clone(),

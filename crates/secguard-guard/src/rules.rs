@@ -13,6 +13,7 @@ use crate::ast::{EffectiveCommand, SpanKind};
 use crate::config::GuardConfig;
 use crate::matcher::{self, ListRule};
 use crate::rule_id::RuleId;
+use std::path::{Component, Path, PathBuf};
 
 pub type RuleHit = (RuleId, String);
 
@@ -36,91 +37,159 @@ pub(crate) fn classify_matches<'a>(
 
 // ── guard self-approval ─────────────────────────────────────────────
 
-/// Commands that only read; mentioning the approvals store from these (with
-/// no redirection anywhere) cannot write a forged approval.
-const READ_ONLY_HEADS: &[&str] = &[
-    "cat", "echo", "file", "git", "grep", "head", "jq", "less", "ls", "printf", "rg", "stat",
-    "tail", "wc",
-];
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
 
-/// The agent must never grant itself guard permission. Flags:
-/// * `… secguard allow …` in any executed command (the human one-shot
-///   grant AND the permanent `allow add` rule writer);
-/// * an executed non-read-only command (`tee`, `cp`, `mv`, `chmod`,
-///   `python -c`, …) with an argument naming the approvals store
-///   (guard-approvals) or a secguard config file;
-/// * a shell redirection (`>`, `>>`) whose target names one of them.
-///
-/// A config file counts because an `[[allow.commands]]` rule written into
-/// `.secguard.toml` is a permanent grant, the same as `secguard allow add`.
-///
-/// `raw` is the full command text: redirect targets are not part of argv.
-pub(crate) fn classify_self_approval(commands: &[EffectiveCommand], raw: &str) -> Option<RuleHit> {
-    const ASK: &str = "guard permissions require approval through the trusted host";
-    const STORE: &str = "guard-approvals";
-    const CONFIG_ASK: &str = "guard policy changes require the trusted host";
-    // Project layer and the user layer (`~/.config/secguard/config.toml`).
-    let config_file = |s: &str| s.contains(".secguard.toml") || s.contains("secguard/config.toml");
-    let basename = |tok: &str| tok.rsplit('/').next().unwrap_or(tok).to_string();
-    for c in commands.iter().filter(|c| c.span == SpanKind::Executed) {
-        let grants = c
-            .argv
-            .windows(2)
-            .enumerate()
-            .any(|(i, w)| {
-                let first = if i == 0 { basename(&w[0]) } else { w[0].clone() };
-                first == "secguard" && w[1] == "allow"
-            })
-            // `--help` / `-h` only print usage (clap exits before granting).
-            && !c.argv.iter().any(|a| a == "--help" || a == "-h");
-        if grants {
+fn read_only(command: &EffectiveCommand) -> bool {
+    match command.head().map(basename) {
+        Some("cat" | "echo" | "file" | "head" | "ls" | "printf" | "stat" | "tail" | "wc") => true,
+        // Only simple read subcommands, never arbitrary git options or aliases.
+        Some("git") => {
+            matches!(
+                command.args().first().map(String::as_str),
+                Some("status" | "log" | "show" | "ls-files" | "rev-parse")
+            ) && command.args()[1..]
+                .iter()
+                .all(|arg| !arg.starts_with('-') || arg == "--")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn classify_self_approval(
+    commands: &[EffectiveCommand],
+    config: &GuardConfig,
+    contextual: bool,
+) -> Option<RuleHit> {
+    let mut unresolved = false;
+    for command in commands.iter().filter(|c| c.span == SpanKind::Executed) {
+        let head = command.head().map(basename);
+        let direct_help = head == Some("secguard")
+            && matches!(command.args(), [subcommand, help]
+                if subcommand == "allow" && matches!(help.as_str(), "--help" | "-h"));
+        if !direct_help
+            && command
+                .argv
+                .windows(2)
+                .any(|pair| basename(&pair[0]) == "secguard" && pair[1] == "allow")
+        {
             return Some((
                 RuleId::GuardSelfApproval,
-                format!("agent invoked `secguard allow`: {ASK}"),
+                "guard permissions require approval through the trusted host".into(),
             ));
         }
-        let writer = c
-            .head()
-            .is_some_and(|h| !READ_ONLY_HEADS.contains(&basename(h).as_str()));
-        if writer && c.args().iter().any(|a| a.contains(STORE)) {
-            return Some((
-                RuleId::GuardSelfApproval,
-                format!("agent command touches the guard approvals store: {ASK}"),
-            ));
+
+        let output = command.head() == Some("__shell_output__");
+        let known_writer = head.is_some_and(|head| {
+            matches!(
+                head,
+                "cp" | "mv"
+                    | "rm"
+                    | "unlink"
+                    | "rmdir"
+                    | "mkdir"
+                    | "tee"
+                    | "touch"
+                    | "chmod"
+                    | "chown"
+                    | "ln"
+                    | "install"
+                    | "truncate"
+                    | "sed"
+                    | "git"
+            )
+        });
+        let writes_directories = matches!(head, Some("rm" | "rmdir" | "mv"))
+            || head == Some("git")
+                && command.args().iter().any(|arg| {
+                    matches!(arg.as_str(), "restore" | "checkout" | "clean" | "rm" | "mv")
+                });
+        if output && command.args().is_empty() {
+            unresolved = true;
         }
-        if writer && c.args().iter().any(|a| config_file(a)) {
-            return Some((
-                RuleId::GuardSelfApproval,
-                format!("agent command touches a secguard config file: {CONFIG_ASK}"),
-            ));
+        if read_only(command) {
+            continue;
+        }
+
+        for operand in command.args() {
+            // Programs also accept paths supplied as --option=path.
+            let operand = operand
+                .strip_prefix('-')
+                .and_then(|flag| flag.split_once('='))
+                .map_or(operand.as_str(), |(_, path)| path);
+            if protected_policy_path(operand, command.cwd.as_deref(), config, writes_directories) {
+                return Some((
+                    RuleId::GuardSelfApproval,
+                    "guard policy changes require approval through the trusted host".into(),
+                ));
+            }
+            if (output || known_writer)
+                && !operand.starts_with('-')
+                && (operand.contains(['$', '`', '*', '?', '[', '{', '~'])
+                    || command.cwd.is_none() && !Path::new(operand).is_absolute())
+            {
+                unresolved = true;
+            }
         }
     }
-    if redirect_targets(raw).any(|t| t.contains(STORE)) {
+    if unresolved && contextual {
         return Some((
-            RuleId::GuardSelfApproval,
-            format!("agent redirects into the guard approvals store: {ASK}"),
-        ));
-    }
-    if redirect_targets(raw).any(config_file) {
-        return Some((
-            RuleId::GuardSelfApproval,
-            format!("agent redirects into a secguard config file: {CONFIG_ASK}"),
+            RuleId::IndirectUnresolved,
+            "guard could not resolve a potential policy write".into(),
         ));
     }
     None
 }
 
-/// Targets of `>` / `>>` redirections in raw shell text (best effort: the
-/// token right after the operator, quotes stripped).
-fn redirect_targets(raw: &str) -> impl Iterator<Item = &str> {
-    raw.split('>').skip(1).filter_map(|rest| {
-        let rest = rest.trim_start_matches(['>', '|', '&']).trim_start();
-        let tok = rest
-            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
-            .next()?;
-        let tok = tok.trim_matches(['"', '\'']);
-        (!tok.is_empty()).then_some(tok)
-    })
+fn protected_policy_path(
+    operand: &str,
+    cwd: Option<&str>,
+    config: &GuardConfig,
+    writes_directories: bool,
+) -> bool {
+    let candidate = Path::new(operand);
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        Path::new(cwd).join(candidate)
+    } else {
+        candidate.to_path_buf()
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.has_root() => {
+                normalized.pop();
+            }
+            _ => normalized.push(component),
+        }
+    }
+    let names_match = |path: &Path| {
+        path.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|name| {
+                matches!(
+                    name,
+                    "guard-approvals" | "guard-approvals.json" | ".secguard.toml"
+                )
+            })
+        }) || path.ends_with("secguard/config.toml")
+    };
+    let explicit_match = |path: &Path| {
+        config.protected_policy_paths.iter().any(|protected| {
+            protected.is_absolute()
+                && (path.starts_with(protected)
+                    || writes_directories && protected.starts_with(path))
+        })
+    };
+    names_match(candidate)
+        || names_match(&normalized)
+        || explicit_match(&normalized)
+        || path.is_absolute()
+            && std::fs::canonicalize(&path)
+                .ok()
+                .is_some_and(|path| names_match(&path) || explicit_match(&path))
 }
 
 /// Configured path denies must run before configured command allows in
@@ -523,7 +592,8 @@ fn rule_rm_family(c: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHit>
     // targeted file deletion, not a catastrophic one. Anything that could
     // widen — exact roots, `..`, globs, shell expansion, recursion, rmdir —
     // stays `rm.rf`.
-    let single_file_capable = (head == "rm" && !parsed.recursive) || head == "unlink";
+    let single_file_capable =
+        (head == "rm" && !parsed.recursive && !parsed.remove_dirs) || head == "unlink";
     let mut targeted_file: Option<&str> = None;
     for op in &effective_operands {
         if is_catastrophic_path(op) {
@@ -624,6 +694,7 @@ fn rm_rule_id(head: &str, parsed: &RmArgs) -> RuleId {
 #[derive(Default, Debug)]
 struct RmArgs {
     recursive: bool,
+    remove_dirs: bool,
     #[allow(dead_code)]
     force: bool,
     no_preserve_root: bool,
@@ -665,9 +736,13 @@ fn parse_rm_args(rm_name: &str, args: &[String]) -> RmArgs {
             out.force = true;
             continue;
         }
+        if a == "--dir" {
+            out.remove_dirs = true;
+            continue;
+        }
         if matches!(
             a.as_str(),
-            "--dir" | "--interactive" | "--verbose" | "--one-file-system"
+            "--interactive" | "--verbose" | "--one-file-system"
         ) {
             continue;
         }
@@ -681,7 +756,8 @@ fn parse_rm_args(rm_name: &str, args: &[String]) -> RmArgs {
                 match ch {
                     'r' | 'R' => out.recursive = true,
                     'f' => out.force = true,
-                    'i' | 'I' | 'v' | 'd' => {}
+                    'd' => out.remove_dirs = true,
+                    'i' | 'I' | 'v' => {}
                     _ => {
                         consumed = false;
                         break;
@@ -803,11 +879,15 @@ fn is_concrete_home_file(operand: &str) -> bool {
     if rest.contains("..") || rest.contains(['*', '?', '[', '{', '$', '`']) {
         return false;
     }
-    let mut components = rest.split('/').filter(|c| !c.is_empty()).peekable();
-    if components.peek().is_none() {
+    if operand.ends_with('/') {
         return false;
     }
-    components.all(|c| c != ".")
+    let account_prefix = operand.starts_with("/Users/") || operand.starts_with("/home/");
+    let mut components = rest.split('/').filter(|c| !c.is_empty()).peekable();
+    if account_prefix && components.next().is_none_or(|account| account == ".") {
+        return false;
+    }
+    components.peek().is_some() && components.all(|c| c != ".")
 }
 
 fn is_safe_operand(operand: &str, safe_patterns: &[String]) -> bool {
