@@ -112,7 +112,15 @@ pub(crate) fn classify_self_approval(
             continue;
         }
 
-        let directory_destination = directory_destination(head, command.args());
+        let (directory_destination, child_destinations) =
+            copy_destinations(head, command.args(), command.cwd.as_deref());
+        for child in child_destinations {
+            match protected_policy_path(&child, command.cwd.as_deref(), config, false) {
+                Ok(true) => return Some(protected_write()),
+                Err(()) => unresolved = true,
+                Ok(false) => {}
+            }
+        }
         let recursive_metadata = matches!(head, Some("chmod" | "chown"))
             && command
                 .args()
@@ -137,12 +145,7 @@ pub(crate) fn classify_self_approval(
             let affects_children =
                 writes_directories || recursive_metadata || destination.is_some();
             match protected_policy_path(operand, command.cwd.as_deref(), config, affects_children) {
-                Ok(true) => {
-                    return Some((
-                        RuleId::GuardSelfApproval,
-                        "guard policy changes require approval through the trusted host".into(),
-                    ))
-                }
+                Ok(true) => return Some(protected_write()),
                 Err(()) if (output || known_writer) && !operand.starts_with('-') => {
                     unresolved = true
                 }
@@ -166,53 +169,108 @@ pub(crate) fn classify_self_approval(
     None
 }
 
-/// Only these modeled writers have a destination operand that can affect a child.
-/// A directory destination is checked conservatively rather than predicting the
-/// utility's copy/link semantics. Arbitrary programs and scripts are not modeled.
-fn directory_destination<'a>(head: Option<&str>, args: &'a [String]) -> Option<(usize, &'a str)> {
-    if !matches!(head, Some("cp" | "install" | "ln")) {
-        return None;
-    }
-    let mut positional = None;
+fn protected_write() -> RuleHit {
+    (
+        RuleId::GuardSelfApproval,
+        "guard policy changes require approval through the trusted host".into(),
+    )
+}
+
+/// Model the direct destination and the children created by common copy/link
+/// forms. Program-specific behavior beyond these operands is outside this check.
+fn copy_destinations<'a>(
+    head: Option<&str>,
+    args: &'a [String],
+    cwd: Option<&str>,
+) -> (Option<(usize, &'a str)>, Vec<String>) {
+    let Some(head @ ("cp" | "install" | "ln")) = head else {
+        return (None, Vec::new());
+    };
+    let mut positional = Vec::new();
+    let mut target = None;
     let mut options = true;
+    let mut no_target_directory = false;
+    let mut create_directories = false;
     let mut args = args.iter().map(String::as_str).enumerate();
     while let Some((index, arg)) = args.next() {
         if !options || !arg.starts_with('-') || arg == "-" {
-            positional = Some((index, arg));
+            positional.push((index, arg));
         } else if arg == "--" {
             options = false;
         } else if let Some(flag) = arg.strip_prefix("--") {
             let (name, value) = flag
                 .split_once('=')
                 .map_or((flag, None), |(name, value)| (name, Some(value)));
-            if !name.is_empty() && "target-directory".starts_with(name) {
-                return value.map(|value| (index, value)).or_else(|| args.next());
-            }
-            if value.is_none()
-                && matches!(
-                    name,
-                    "suffix" | "group" | "mode" | "owner" | "strip-program"
-                )
+            let prefix = |option: &str, min| name.len() >= min && option.starts_with(name);
+            if prefix("target-directory", 1) {
+                target = value.map(|value| (index, value)).or_else(|| args.next());
+            } else if prefix("no-target-directory", 4) {
+                no_target_directory = true;
+            } else if head == "install" && prefix("directory", 2) {
+                create_directories = true;
+            } else if value.is_none()
+                && (prefix("suffix", 2)
+                    || head == "install"
+                        && (prefix("group", 1)
+                            || prefix("mode", 1)
+                            || prefix("owner", 1)
+                            || prefix("strip-program", 6))
+                    || head == "cp" && (prefix("sparse", 2) || prefix("no-preserve", 4)))
             {
                 args.next();
             }
-        } else if let Some((offset, flag)) = arg.char_indices().find(|(_, flag)| {
-            matches!(flag, 'S' | 't') || head == Some("install") && matches!(flag, 'g' | 'm' | 'o')
-        }) {
-            let value = &arg[offset + 1..];
-            if flag == 't' {
-                return if value.is_empty() {
-                    args.next()
-                } else {
-                    Some((index, value))
-                };
-            }
-            if value.is_empty() {
-                args.next();
+        } else {
+            for (offset, flag) in arg.char_indices().skip(1) {
+                if flag == 'T' {
+                    no_target_directory = true;
+                }
+                if head == "install" && flag == 'd' {
+                    create_directories = true;
+                }
+                if matches!(flag, 'S' | 't') || head == "install" && matches!(flag, 'g' | 'm' | 'o')
+                {
+                    let value = &arg[offset + 1..];
+                    let argument = if value.is_empty() {
+                        args.next()
+                    } else {
+                        Some((index, value))
+                    };
+                    if flag == 't' {
+                        target = argument;
+                    }
+                    break;
+                }
             }
         }
     }
-    positional
+    if create_directories {
+        return (None, Vec::new());
+    }
+
+    let explicit_target = target.is_some();
+    let destination = if head == "ln" && positional.len() == 1 && !explicit_target {
+        None
+    } else {
+        target.or_else(|| positional.pop())
+    };
+    let path = destination.map_or(".", |(_, path)| path);
+    let directory = Path::new(path);
+    let known_directory = if directory.is_absolute() {
+        directory.is_dir()
+    } else {
+        cwd.is_some_and(|cwd| Path::new(cwd).join(directory).is_dir())
+    };
+    if no_target_directory
+        || !explicit_target && !known_directory && positional.len() < 2 && !path.ends_with('/')
+    {
+        return (destination, Vec::new());
+    }
+    let children = positional
+        .into_iter()
+        .filter_map(|(_, source)| Path::new(source).file_name())
+        .filter_map(|name| directory.join(name).into_os_string().into_string().ok())
+        .collect();
+    (destination, children)
 }
 
 fn protected_policy_path(
