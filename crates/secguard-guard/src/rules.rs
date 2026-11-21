@@ -112,10 +112,9 @@ pub(crate) fn classify_self_approval(
             continue;
         }
 
-        let (directory_destination, child_destinations) =
-            copy_destinations(head, command.args(), command.cwd.as_deref());
-        for child in child_destinations {
-            match protected_policy_path(&child, command.cwd.as_deref(), config, false) {
+        let copy_paths = copy_paths(head, command.args(), command.cwd.as_deref());
+        for child in copy_paths.iter().flat_map(|paths| &paths.children) {
+            match protected_policy_path(child, command.cwd.as_deref(), config, false) {
                 Ok(true) => return Some(protected_write()),
                 Err(()) => unresolved = true,
                 Ok(false) => {}
@@ -131,28 +130,47 @@ pub(crate) fn classify_self_approval(
                         || arg.starts_with('-') && !arg.starts_with("--") && arg.contains('R')
                 });
 
-        for (index, operand) in command.args().iter().enumerate() {
-            let destination = directory_destination.filter(|(position, _)| *position == index);
-            // Programs also accept paths supplied as --option=path.
-            let operand = if let Some((_, path)) = destination {
-                path
-            } else {
-                operand
-                    .strip_prefix('-')
-                    .and_then(|flag| flag.split_once('='))
-                    .map_or(operand.as_str(), |(_, path)| path)
-            };
-            let affects_children =
-                writes_directories || recursive_metadata || destination.is_some();
+        let generic_paths = || {
+            let mut options = !output;
+            command.args().iter().filter_map(move |operand| {
+                if options && operand == "--" {
+                    options = false;
+                    return None;
+                }
+                // Some programs also accept path values attached to options.
+                let path = if options {
+                    operand
+                        .strip_prefix('-')
+                        .and_then(|flag| flag.split_once('='))
+                        .map_or(operand.as_str(), |(_, path)| path)
+                } else {
+                    operand.as_str()
+                };
+                Some((path, false, !options || !path.starts_with('-')))
+            })
+        };
+        let modeled_paths = copy_paths.iter().flat_map(|paths| {
+            paths
+                .operands
+                .iter()
+                .map(|&(path, destination)| (path, destination, true))
+        });
+        let operands = modeled_paths.chain(
+            copy_paths
+                .is_none()
+                .then(generic_paths)
+                .into_iter()
+                .flatten(),
+        );
+        for (operand, destination, check_uncertainty) in operands {
+            let affects_children = writes_directories || recursive_metadata || destination;
             match protected_policy_path(operand, command.cwd.as_deref(), config, affects_children) {
                 Ok(true) => return Some(protected_write()),
-                Err(()) if (output || known_writer) && !operand.starts_with('-') => {
-                    unresolved = true
-                }
+                Err(()) if (output || known_writer) && check_uncertainty => unresolved = true,
                 _ => {}
             }
             if (output || known_writer)
-                && !operand.starts_with('-')
+                && check_uncertainty
                 && (operand.contains(['$', '`', '*', '?', '[', '{', '~'])
                     || command.cwd.is_none() && !Path::new(operand).is_absolute())
             {
@@ -176,25 +194,29 @@ fn protected_write() -> RuleHit {
     )
 }
 
-/// Model the direct destination and the children created by common copy/link
-/// forms. Program-specific behavior beyond these operands is outside this check.
-fn copy_destinations<'a>(
+struct CopyPaths<'a> {
+    operands: Vec<(&'a str, bool)>,
+    children: Vec<String>,
+}
+
+/// Collect filesystem operands and immediate children for modeled copy/link forms.
+fn copy_paths<'a>(
     head: Option<&str>,
     args: &'a [String],
     cwd: Option<&str>,
-) -> (Option<(usize, &'a str)>, Vec<String>) {
-    let Some(head @ ("cp" | "install" | "ln")) = head else {
-        return (None, Vec::new());
+) -> Option<CopyPaths<'a>> {
+    let head @ ("cp" | "install" | "ln") = head? else {
+        return None;
     };
     let mut positional = Vec::new();
     let mut target = None;
     let mut options = true;
     let mut no_target_directory = false;
     let mut create_directories = false;
-    let mut args = args.iter().map(String::as_str).enumerate();
-    while let Some((index, arg)) = args.next() {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
         if !options || !arg.starts_with('-') || arg == "-" {
-            positional.push((index, arg));
+            positional.push(arg);
         } else if arg == "--" {
             options = false;
         } else if let Some(flag) = arg.strip_prefix("--") {
@@ -203,7 +225,7 @@ fn copy_destinations<'a>(
                 .map_or((flag, None), |(name, value)| (name, Some(value)));
             let prefix = |option: &str, min| name.len() >= min && option.starts_with(name);
             if prefix("target-directory", 1) {
-                target = value.map(|value| (index, value)).or_else(|| args.next());
+                target = value.or_else(|| args.next());
             } else if prefix("no-target-directory", 4) {
                 no_target_directory = true;
             } else if head == "install" && prefix("directory", 2) {
@@ -233,7 +255,7 @@ fn copy_destinations<'a>(
                     let argument = if value.is_empty() {
                         args.next()
                     } else {
-                        Some((index, value))
+                        Some(value)
                     };
                     if flag == 't' {
                         target = argument;
@@ -244,7 +266,10 @@ fn copy_destinations<'a>(
         }
     }
     if create_directories {
-        return (None, Vec::new());
+        return Some(CopyPaths {
+            operands: positional.into_iter().map(|path| (path, false)).collect(),
+            children: Vec::new(),
+        });
     }
 
     let explicit_target = target.is_some();
@@ -253,24 +278,32 @@ fn copy_destinations<'a>(
     } else {
         target.or_else(|| positional.pop())
     };
-    let path = destination.map_or(".", |(_, path)| path);
+    let path = destination.unwrap_or(".");
     let directory = Path::new(path);
     let known_directory = if directory.is_absolute() {
         directory.is_dir()
     } else {
         cwd.is_some_and(|cwd| Path::new(cwd).join(directory).is_dir())
     };
-    if no_target_directory
-        || !explicit_target && !known_directory && positional.len() < 2 && !path.ends_with('/')
+    let children = if !no_target_directory
+        && (explicit_target || known_directory || positional.len() >= 2 || path.ends_with('/'))
     {
-        return (destination, Vec::new());
-    }
-    let children = positional
-        .into_iter()
-        .filter_map(|(_, source)| Path::new(source).file_name())
-        .filter_map(|name| directory.join(name).into_os_string().into_string().ok())
-        .collect();
-    (destination, children)
+        positional
+            .iter()
+            .filter_map(|source| Path::new(source).file_name())
+            .filter_map(|name| directory.join(name).into_os_string().into_string().ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(CopyPaths {
+        operands: positional
+            .into_iter()
+            .map(|path| (path, false))
+            .chain(destination.map(|path| (path, true)))
+            .collect(),
+        children,
+    })
 }
 
 fn protected_policy_path(
