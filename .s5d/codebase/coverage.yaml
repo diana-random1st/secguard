@@ -1,0 +1,37 @@
+product: secguard
+total_modules: 4
+governed: 0
+partial: 1
+blind: 3
+modules:
+- module:
+    name: crates
+    path: crates
+    language: Mixed
+    file_count: 212
+  status: partial
+  specs:
+  - feat.bash-guard-rule-expansion
+  - feat.enforcement-coverage-matrix
+  - feat.guard-indirection-hardening
+- module:
+    name: deploy
+    path: deploy
+    language: Unknown
+    file_count: 9
+  status: blind
+  specs: []
+- module:
+    name: docs
+    path: docs
+    language: Unknown
+    file_count: 1
+  status: blind
+  specs: []
+- module:
+    name: training
+    path: training
+    language: Mixed
+    file_count: 9
+  status: blind
+  specs: []

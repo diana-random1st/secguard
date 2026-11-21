@@ -105,6 +105,10 @@ pub struct ParseResult {
 /// Parse a raw bash command. Always returns a list of commands (possibly
 /// empty) and a flag indicating whether the parse hit any error nodes.
 pub fn parse(source: &str) -> ParseResult {
+    parse_with_cwd(source, None)
+}
+
+pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -124,6 +128,7 @@ pub fn parse(source: &str) -> ParseResult {
 
     let bytes = source.as_bytes();
     let mut walker = Walker::new(bytes);
+    walker.cwd = cwd.map(str::to_owned);
     walker.walk_program(tree.root_node());
 
     ParseResult {

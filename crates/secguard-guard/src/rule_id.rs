@@ -21,6 +21,7 @@ pub enum RuleId {
     GitHistoryRewrite,
     RmRf,
     RmRecursive,
+    RmTargetedFile,
     FindDelete,
     Shred,
     SqlDestructive,
@@ -45,15 +46,66 @@ pub enum RuleId {
     GsutilMutation,
     GraphqlMutation,
     ChmodWorldWritable,
+    GuardSelfApproval,
     Brain,
     /// Network egress blocked by lockdown mode.
     LockdownEgress,
 }
 
+/// Whether an exact-action approval can exempt a matched predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleProtection {
+    HardDeny,
+    Unresolved,
+    ApprovalEligible,
+}
+
 impl RuleId {
+    pub(crate) const fn protection(self) -> RuleProtection {
+        match self {
+            Self::GuardSelfApproval
+            | Self::NoVerify
+            | Self::RmRf
+            | Self::ChmodWorldWritable
+            | Self::Brain
+            | Self::LockdownEgress => RuleProtection::HardDeny,
+            Self::IndirectUnresolved | Self::PipeToShell => RuleProtection::Unresolved,
+            Self::GitForcePush
+            | Self::GitResetHard
+            | Self::GitResetMerge
+            | Self::GitCleanForce
+            | Self::GitCheckoutPathspec
+            | Self::GitRestorePathspec
+            | Self::GitBranchForceDelete
+            | Self::GitStashLoss
+            | Self::GitHistoryRewrite
+            | Self::RmRecursive
+            | Self::RmTargetedFile
+            | Self::FindDelete
+            | Self::Shred
+            | Self::SqlDestructive
+            | Self::DockerPrune
+            | Self::HttpDeleteExternal
+            | Self::UnsafeKill
+            | Self::AwsS3Rm
+            | Self::GhDestructive
+            | Self::SaasDestroy
+            | Self::TerraformMutation
+            | Self::RedisDestructive
+            | Self::OpensearchMutation
+            | Self::MongoDestructive
+            | Self::OrmMigration
+            | Self::SupabaseDbMutation
+            | Self::HelmMutation
+            | Self::KubectlMutation
+            | Self::DockerPush
+            | Self::GsutilMutation
+            | Self::GraphqlMutation => RuleProtection::ApprovalEligible,
+        }
+    }
+
     pub const fn as_code(self) -> &'static str {
         match self {
-            RuleId::LockdownEgress => "lockdown.egress",
             RuleId::GitForcePush => "git.force_push",
             RuleId::GitResetHard => "git.reset_hard",
             RuleId::GitResetMerge => "git.reset_merge",
@@ -65,6 +117,7 @@ impl RuleId {
             RuleId::GitHistoryRewrite => "git.history_rewrite",
             RuleId::RmRf => "rm.rf",
             RuleId::RmRecursive => "rm.recursive",
+            RuleId::RmTargetedFile => "rm.targeted_file",
             RuleId::FindDelete => "rm.find_delete",
             RuleId::Shred => "rm.shred",
             RuleId::SqlDestructive => "db_client.sql_destructive",
@@ -89,25 +142,25 @@ impl RuleId {
             RuleId::GsutilMutation => "infra.gsutil_mutation",
             RuleId::GraphqlMutation => "infra.cloud_api_mutation",
             RuleId::ChmodWorldWritable => "fs.chmod_world_writable",
+            RuleId::GuardSelfApproval => "guard.self_approval",
             RuleId::Brain => "brain.classification",
+            RuleId::LockdownEgress => "lockdown.egress",
         }
     }
 }
 
 impl RuleId {
-    /// 2D damage score for this rule (RAN-414).
+    /// 2D damage score for this rule.
     ///
     /// Exhaustive `match` with **no wildcard arm**: adding a [`RuleId`]
     /// variant without a score here is a compile error (E0004,
     /// non-exhaustive match). This is the type-system enforcement for
     /// "every rule must declare a blast × reversibility score" — there is
-    /// no runtime fallback to forget. See `docs/scoring.md`.
+    /// no runtime fallback to forget.
     pub const fn score(self) -> crate::scoring::Decision {
         use crate::scoring::Decision as D;
         match self {
             // Git — mostly local repo state; reflog/up-down make many recoverable.
-            // Blocks data exfiltration; the target is remote, so recovery is not local.
-            RuleId::LockdownEgress => D::new(3, 0),
             RuleId::GitForcePush => D::new(3, 2),
             // `git reset --hard` discards uncommitted working-tree changes,
             // which the reflog does NOT recover (it tracks commits, not the
@@ -124,6 +177,10 @@ impl RuleId {
             // rm family — rm.rs only emits these for non-safe (dangerous) paths.
             RuleId::RmRf => D::new(3, 0),
             RuleId::RmRecursive => D::new(2, 0),
+            // Non-recursive rm/unlink of ONE concrete file under $HOME (no glob,
+            // no `..`, no expansion). Scored like `Shred`: a single file,
+            // permanently gone -> Confirm, ackable with a logged `guard-ack`.
+            RuleId::RmTargetedFile => D::new(1, 0),
             RuleId::FindDelete => D::new(2, 0),
             RuleId::Shred => D::new(1, 0), // single file, intentionally permanent
             // Databases — data loss, frequently prod, no assumed backup.
@@ -154,8 +211,13 @@ impl RuleId {
             // World-writable perms: broad security exposure; original per-file
             // modes are not cheaply restorable after a recursive blanket chmod.
             RuleId::ChmodWorldWritable => D::new(3, 1),
+            // Granting guard permission (`secguard allow`, the approvals store)
+            // switches off every blast-3 rule for a command: human-only, never
+            // ackable, maximal blast.
+            RuleId::GuardSelfApproval => D::new(4, 0),
             // ML catch-all — conservative default for flagged unknowns.
             RuleId::Brain => D::new(2, 1),
+            RuleId::LockdownEgress => D::new(3, 0),
         }
     }
 }

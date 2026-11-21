@@ -13,6 +13,18 @@ pub struct SecretRule {
 /// Rules are ordered from most-specific to least-specific.
 /// Each regex must contain a named capture group `secret`.
 pub fn default_rules() -> Vec<SecretRule> {
+    compile_rules(|_| true)
+}
+
+/// Only the rules whose keyword pre-filter passes for `text` — the same rules
+/// `Scanner::scan` would run on it, so findings are identical. Compiling all
+/// 150+ regexes costs ~1.3 s even in release; a hook that scans one short
+/// command per process pays for just the rules its text can trigger.
+pub(crate) fn rules_for_text(text: &str) -> Vec<SecretRule> {
+    compile_rules(|kws| kws.is_empty() || kws.iter().any(|kw| text.contains(kw)))
+}
+
+fn compile_rules(keep: impl Fn(&[&str]) -> bool) -> Vec<SecretRule> {
     let defs: &[(&str, &str, &str, &[&str])] = &[
         // ── Cloud providers ──────────────────────────────────────────
         (
@@ -430,6 +442,7 @@ pub fn default_rules() -> Vec<SecretRule> {
     ];
 
     defs.iter()
+        .filter(|(_, _, _, kws)| keep(kws))
         .filter_map(|(id, desc, pat, kws)| {
             Regex::new(pat).ok().map(|pattern| SecretRule {
                 id,
@@ -453,6 +466,27 @@ mod tests {
             "Expected 150+ rules, got {}",
             rules.len()
         );
+    }
+
+    #[test]
+    fn rules_for_text_finds_what_the_full_scanner_finds() {
+        let samples = [
+            "git commit -m 'feat: x'",
+            "curl -H 'Authorization: Bearer ghp_1234567890abcdefghijklmnopqrstuvwxyzAB' x",
+            "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "",
+        ];
+        let scanner = crate::Scanner::new();
+        for text in samples {
+            let full = scanner.scan(text);
+            let narrow = crate::Scanner::scan_text(text);
+            let ids = |f: &[crate::Finding]| {
+                f.iter()
+                    .map(|x| (x.rule_id.clone(), x.start, x.end))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&full), ids(&narrow), "{text}");
+        }
     }
 
     #[test]

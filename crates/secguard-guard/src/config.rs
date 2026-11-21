@@ -269,6 +269,33 @@ fn compile_rules<'a>(
         .collect()
 }
 
+/// Compile policy for enforcement. Any malformed rule invalidates the decision.
+pub fn try_build_rule_lists(
+    cfg: &GuardConfig,
+) -> Result<CompiledRuleLists, crate::matcher::SpecError> {
+    Ok(CompiledRuleLists {
+        deny: CompiledRuleBuckets {
+            commands: try_compile_rules(cfg.deny.commands.iter().chain(&cfg.blacklist))?,
+            paths: try_compile_rules(cfg.deny.paths.iter())?,
+            secrets: try_compile_rules(cfg.deny.secrets.iter())?,
+        },
+        allow: CompiledRuleBuckets {
+            commands: try_compile_rules(cfg.allow.commands.iter().chain(&cfg.whitelist))?,
+            paths: try_compile_rules(cfg.allow.paths.iter())?,
+            secrets: try_compile_rules(cfg.allow.secrets.iter())?,
+        },
+    })
+}
+
+fn try_compile_rules<'a>(
+    specs: impl Iterator<Item = &'a crate::matcher::ListRuleSpec>,
+) -> Result<Vec<crate::matcher::ListRule>, crate::matcher::SpecError> {
+    specs
+        .cloned()
+        .map(crate::matcher::ListRule::try_from)
+        .collect()
+}
+
 /// Resolve the effective strict_block setting: env override wins, then config.
 /// Recognised env values mirror SECGUARD_SHADOW: `0`/`off`/`false`/empty = off,
 /// anything else = on. Unset env → fall through to config.

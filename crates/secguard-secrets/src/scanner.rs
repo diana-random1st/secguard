@@ -47,6 +47,15 @@ impl Scanner {
         }
     }
 
+    /// Scan one text using only the rules applicable to that same input.
+    // @s5d:component comp.embedded-policy-parity
+    pub fn scan_text(text: &str) -> Vec<Finding> {
+        Self {
+            rules: rules::rules_for_text(text),
+        }
+        .scan(text)
+    }
+
     /// Scan text and return all detected secrets.
     ///
     /// Findings are sorted by position and deduplicated (overlapping matches

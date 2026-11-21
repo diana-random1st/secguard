@@ -99,15 +99,15 @@ fn check_with_config_applies_allow_before_default_rules() {
     let cfg = config_from(
         r#"
 [[whitelist]]
-id = "allow-local-target-clean"
+id = "allow-local-git-clean"
 type = "literal"
-pattern = "rm -rf target/debug"
-reason = "local build cache"
+pattern = "git clean -fd"
+reason = "local generated artifacts"
 "#,
     );
 
     assert_eq!(
-        check_with_config("rm -rf target/debug", &cfg),
+        check_with_config("git clean -fd", &cfg),
         Verdict::Safe
     );
 }

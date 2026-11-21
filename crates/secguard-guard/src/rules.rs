@@ -18,18 +18,109 @@ pub type RuleHit = (RuleId, String);
 
 /// Run all predicate rules over `cmd` and return the first match.
 pub fn classify(cmd: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHit> {
-    if cmd.span != SpanKind::Executed {
-        return None;
-    }
-    if cmd.argv.is_empty() {
-        return None;
-    }
-    for rule in RULES {
-        if let Some(hit) = rule(cmd, config) {
-            return Some(hit);
+    classify_matches(cmd, config, None).next()
+}
+
+/// Evaluate predicates in declaration order, excluding the approved rule.
+pub(crate) fn classify_matches<'a>(
+    cmd: &'a EffectiveCommand,
+    config: &'a GuardConfig,
+    exempt: Option<RuleId>,
+) -> impl Iterator<Item = RuleHit> + 'a {
+    RULES
+        .iter()
+        .filter(move |_| cmd.span == SpanKind::Executed && !cmd.argv.is_empty())
+        .filter_map(move |rule| rule(cmd, config))
+        .filter(move |hit| exempt != Some(hit.0))
+}
+
+// ── guard self-approval ─────────────────────────────────────────────
+
+/// Commands that only read; mentioning the approvals store from these (with
+/// no redirection anywhere) cannot write a forged approval.
+const READ_ONLY_HEADS: &[&str] = &[
+    "cat", "echo", "file", "git", "grep", "head", "jq", "less", "ls", "printf", "rg", "stat",
+    "tail", "wc",
+];
+
+/// The agent must never grant itself guard permission. Flags:
+/// * `… secguard allow …` in any executed command (the human one-shot
+///   grant AND the permanent `allow add` rule writer);
+/// * an executed non-read-only command (`tee`, `cp`, `mv`, `chmod`,
+///   `python -c`, …) with an argument naming the approvals store
+///   (guard-approvals) or a secguard config file;
+/// * a shell redirection (`>`, `>>`) whose target names one of them.
+///
+/// A config file counts because an `[[allow.commands]]` rule written into
+/// `.secguard.toml` is a permanent grant, the same as `secguard allow add`.
+///
+/// `raw` is the full command text: redirect targets are not part of argv.
+pub(crate) fn classify_self_approval(commands: &[EffectiveCommand], raw: &str) -> Option<RuleHit> {
+    const ASK: &str = "guard permissions require approval through the trusted host";
+    const STORE: &str = "guard-approvals";
+    const CONFIG_ASK: &str = "guard policy changes require the trusted host";
+    // Project layer and the user layer (`~/.config/secguard/config.toml`).
+    let config_file = |s: &str| s.contains(".secguard.toml") || s.contains("secguard/config.toml");
+    let basename = |tok: &str| tok.rsplit('/').next().unwrap_or(tok).to_string();
+    for c in commands.iter().filter(|c| c.span == SpanKind::Executed) {
+        let grants = c
+            .argv
+            .windows(2)
+            .enumerate()
+            .any(|(i, w)| {
+                let first = if i == 0 { basename(&w[0]) } else { w[0].clone() };
+                first == "secguard" && w[1] == "allow"
+            })
+            // `--help` / `-h` only print usage (clap exits before granting).
+            && !c.argv.iter().any(|a| a == "--help" || a == "-h");
+        if grants {
+            return Some((
+                RuleId::GuardSelfApproval,
+                format!("agent invoked `secguard allow`: {ASK}"),
+            ));
+        }
+        let writer = c
+            .head()
+            .is_some_and(|h| !READ_ONLY_HEADS.contains(&basename(h).as_str()));
+        if writer && c.args().iter().any(|a| a.contains(STORE)) {
+            return Some((
+                RuleId::GuardSelfApproval,
+                format!("agent command touches the guard approvals store: {ASK}"),
+            ));
+        }
+        if writer && c.args().iter().any(|a| config_file(a)) {
+            return Some((
+                RuleId::GuardSelfApproval,
+                format!("agent command touches a secguard config file: {CONFIG_ASK}"),
+            ));
         }
     }
+    if redirect_targets(raw).any(|t| t.contains(STORE)) {
+        return Some((
+            RuleId::GuardSelfApproval,
+            format!("agent redirects into the guard approvals store: {ASK}"),
+        ));
+    }
+    if redirect_targets(raw).any(config_file) {
+        return Some((
+            RuleId::GuardSelfApproval,
+            format!("agent redirects into a secguard config file: {CONFIG_ASK}"),
+        ));
+    }
     None
+}
+
+/// Targets of `>` / `>>` redirections in raw shell text (best effort: the
+/// token right after the operator, quotes stripped).
+fn redirect_targets(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split('>').skip(1).filter_map(|rest| {
+        let rest = rest.trim_start_matches(['>', '|', '&']).trim_start();
+        let tok = rest
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+            .next()?;
+        let tok = tok.trim_matches(['"', '\'']);
+        (!tok.is_empty()).then_some(tok)
+    })
 }
 
 /// Configured path denies must run before configured command allows in
@@ -37,8 +128,8 @@ pub fn classify(cmd: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHit>
 /// default heuristic dispatcher.
 pub(crate) fn classify_configured_path_deny(
     cmd: &EffectiveCommand,
-    config: &GuardConfig,
-) -> Option<RuleHit> {
+    deny_paths: &[ListRule],
+) -> Option<String> {
     if cmd.span != SpanKind::Executed {
         return None;
     }
@@ -49,8 +140,7 @@ pub(crate) fn classify_configured_path_deny(
 
     let parsed = parse_rm_args(head, cmd.args());
     let effective_operands = effectivise_operands(&parsed.operands, cmd.cwd.as_deref());
-    let lists = crate::config::build_rule_lists(config);
-    configured_path_deny(head, &parsed, &effective_operands, &lists.deny.paths)
+    configured_path_deny(&effective_operands, deny_paths)
 }
 
 type Rule = fn(&EffectiveCommand, &GuardConfig) -> Option<RuleHit>;
@@ -428,15 +518,43 @@ fn rule_rm_family(c: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHit>
     }
 
     let effective_operands = effectivise_operands(&parsed.operands, c.cwd.as_deref());
+    // A non-recursive rm/unlink of one concrete file under a home prefix
+    // (`rm -f ~/notes.md`) cannot take the tree with it: it is a
+    // targeted file deletion, not a catastrophic one. Anything that could
+    // widen — exact roots, `..`, globs, shell expansion, recursion, rmdir —
+    // stays `rm.rf`.
+    let single_file_capable = (head == "rm" && !parsed.recursive) || head == "unlink";
+    let mut targeted_file: Option<&str> = None;
     for op in &effective_operands {
         if is_catastrophic_path(op) {
+            if single_file_capable && effective_operands.len() == 1 && is_concrete_home_file(op) {
+                targeted_file.get_or_insert(op.as_str());
+                continue;
+            }
             return Some((RuleId::RmRf, format!("{head} of catastrophic path: {op}")));
         }
     }
 
-    let lists = crate::config::build_rule_lists(config);
-    if let Some(hit) = configured_path_deny(head, &parsed, &effective_operands, &lists.deny.paths) {
-        return Some(hit);
+    let Ok(lists) = crate::config::try_build_rule_lists(config) else {
+        return Some((
+            rm_rule_id(head, &parsed),
+            "guard policy contains an invalid rule".into(),
+        ));
+    };
+    if let Some(rule_id) = configured_path_deny(&effective_operands, &lists.deny.paths) {
+        return Some((
+            rm_rule_id(head, &parsed),
+            format!("config deny path rule {rule_id}"),
+        ));
+    }
+
+    if let Some(op) = targeted_file {
+        return Some((
+            RuleId::RmTargetedFile,
+            format!(
+                "{head} of a single file under the home directory (targeted file deletion): {op}"
+            ),
+        ));
     }
 
     if head == "rm" && !parsed.recursive {
@@ -479,22 +597,13 @@ fn rule_rm_family(c: &EffectiveCommand, config: &GuardConfig) -> Option<RuleHit>
     ))
 }
 
-fn configured_path_deny(
-    head: &str,
-    parsed: &RmArgs,
-    operands: &[String],
-    deny_paths: &[ListRule],
-) -> Option<RuleHit> {
-    for op in operands {
-        if let matcher::Decision::Deny { rule_id, reason } = matcher::evaluate(op, deny_paths, &[])
-        {
-            let detail = reason
-                .map(|r| format!("config deny path rule {rule_id} on {op}: {r}"))
-                .unwrap_or_else(|| format!("config deny path rule {rule_id} on {op}"));
-            return Some((rm_rule_id(head, parsed), detail));
-        }
-    }
-    None
+fn configured_path_deny(operands: &[String], deny_paths: &[ListRule]) -> Option<String> {
+    operands
+        .iter()
+        .find_map(|op| match matcher::evaluate(op, deny_paths, &[]) {
+            matcher::Decision::Deny { rule_id, .. } => Some(rule_id),
+            _ => None,
+        })
 }
 
 fn path_allowed_by_config(operand: &str, allow_paths: &[ListRule]) -> bool {
@@ -682,6 +791,25 @@ fn is_catastrophic_path(operand: &str) -> bool {
     false
 }
 
+/// True for a concrete, non-root path under a home prefix: no glob, no
+/// `..`/`.` component, no further shell expansion. Only called for operands
+/// already flagged by [`is_catastrophic_path`]; system prefixes (`/etc/`,
+/// `/usr/`, ...) never qualify.
+fn is_concrete_home_file(operand: &str) -> bool {
+    const HOME_PREFIXES: &[&str] = &["/Users/", "/home/", "~/", "$HOME/", "${HOME}/"];
+    let Some(rest) = HOME_PREFIXES.iter().find_map(|p| operand.strip_prefix(p)) else {
+        return false;
+    };
+    if rest.contains("..") || rest.contains(['*', '?', '[', '{', '$', '`']) {
+        return false;
+    }
+    let mut components = rest.split('/').filter(|c| !c.is_empty()).peekable();
+    if components.peek().is_none() {
+        return false;
+    }
+    components.all(|c| c != ".")
+}
+
 fn is_safe_operand(operand: &str, safe_patterns: &[String]) -> bool {
     if operand.contains("..") {
         return false;
@@ -829,7 +957,7 @@ fn rule_pipe_to_shell(c: &EffectiveCommand, _: &GuardConfig) -> Option<RuleHit> 
     if c.head() == Some("__eval_dynamic__") {
         let body = c.args().first().map(String::as_str).unwrap_or("");
         return Some((
-            RuleId::PipeToShell,
+            RuleId::IndirectUnresolved,
             format!("eval of dynamic input (unknown body): {body}"),
         ));
     }

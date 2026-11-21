@@ -1,0 +1,16 @@
+- name: crates
+  path: crates
+  language: Mixed
+  file_count: 212
+- name: deploy
+  path: deploy
+  language: Unknown
+  file_count: 9
+- name: docs
+  path: docs
+  language: Unknown
+  file_count: 1
+- name: training
+  path: training
+  language: Mixed
+  file_count: 9

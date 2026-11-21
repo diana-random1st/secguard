@@ -153,7 +153,7 @@ pub fn is_lockdown_egress_command(cmd: &EffectiveCommand) -> Option<RuleHit> {
             // is piped and the URL gets promoted to command position.
             Some((
                 RuleId::LockdownEgress,
-                format!("lockdown: bare URL `{head}` in command position blocked"),
+                "lockdown: bare URL in command position blocked".into(),
             ))
         }
         _ => None,

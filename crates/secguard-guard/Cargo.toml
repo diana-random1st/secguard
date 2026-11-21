@@ -23,14 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 shell-words = "1"
-# Downgraded from upstream secguard (which used tree-sitter 0.26 + tree-sitter-bash 0.25).
-# Reason: tree-sitter is a -sys crate with `links = "tree-sitter"` so only one
-# version can be linked in the final binary. Diana already uses 0.24 across
-# tree-sitter-rust / python / typescript / javascript / go. Forcing 0.26 here
-# would force an upgrade of every other tree-sitter-* crate Diana uses.
-# Going down is the cheaper direction. If secguard-guard's AST code relies on
-# any 0.25/0.26-only API, we either restore that API surface from the upgrade
-# delta or cap the AST module's expectations — recorded in commit body.
+# Match the tree-sitter version linked by the Diana host.
 tree-sitter = { workspace = true }
 tree-sitter-bash = "0.23"
 secguard-brain = { path = "../secguard-brain", optional = true }
