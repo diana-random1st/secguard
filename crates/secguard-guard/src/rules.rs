@@ -112,17 +112,36 @@ pub(crate) fn classify_self_approval(
             continue;
         }
 
-        for operand in command.args() {
+        let directory_destination = directory_destination(head, command.args());
+        let recursive_metadata = matches!(head, Some("chmod" | "chown"))
+            && command
+                .args()
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    arg == "--recursive"
+                        || arg.starts_with('-') && !arg.starts_with("--") && arg.contains('R')
+                });
+
+        for (index, operand) in command.args().iter().enumerate() {
             // Programs also accept paths supplied as --option=path.
             let operand = operand
                 .strip_prefix('-')
                 .and_then(|flag| flag.split_once('='))
                 .map_or(operand.as_str(), |(_, path)| path);
-            if protected_policy_path(operand, command.cwd.as_deref(), config, writes_directories) {
-                return Some((
-                    RuleId::GuardSelfApproval,
-                    "guard policy changes require approval through the trusted host".into(),
-                ));
+            let affects_children =
+                writes_directories || recursive_metadata || directory_destination == Some(index);
+            match protected_policy_path(operand, command.cwd.as_deref(), config, affects_children) {
+                Ok(true) => {
+                    return Some((
+                        RuleId::GuardSelfApproval,
+                        "guard policy changes require approval through the trusted host".into(),
+                    ))
+                }
+                Err(()) if (output || known_writer) && !operand.starts_with('-') => {
+                    unresolved = true
+                }
+                _ => {}
             }
             if (output || known_writer)
                 && !operand.starts_with('-')
@@ -142,12 +161,33 @@ pub(crate) fn classify_self_approval(
     None
 }
 
+/// Only these modeled writers have a destination operand that can affect a child.
+/// A directory destination is checked conservatively rather than predicting the
+/// utility's copy/link semantics. Arbitrary programs and scripts are not modeled.
+fn directory_destination(head: Option<&str>, args: &[String]) -> Option<usize> {
+    if !matches!(head, Some("cp" | "install" | "ln")) {
+        return None;
+    }
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "-t" || arg == "--target-directory" {
+            return Some(index + 1);
+        }
+        if arg.starts_with("--target-directory=") {
+            return Some(index);
+        }
+    }
+    args.len().checked_sub(1)
+}
+
 fn protected_policy_path(
     operand: &str,
     cwd: Option<&str>,
     config: &GuardConfig,
     writes_directories: bool,
-) -> bool {
+) -> Result<bool, ()> {
     let candidate = Path::new(operand);
     let path = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -183,13 +223,47 @@ fn protected_policy_path(
                     || writes_directories && protected.starts_with(path))
         })
     };
-    names_match(candidate)
-        || names_match(&normalized)
-        || explicit_match(&normalized)
-        || path.is_absolute()
-            && std::fs::canonicalize(&path)
-                .ok()
-                .is_some_and(|path| names_match(&path) || explicit_match(&path))
+    if names_match(candidate) || names_match(&normalized) || explicit_match(&normalized) {
+        return Ok(true);
+    }
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let resolved = resolve_write_path(&path)?;
+    Ok(names_match(&resolved) || explicit_match(&resolved))
+}
+
+/// Canonicalize the existing prefix, retaining a missing suffix for new outputs.
+/// A dangling link or lookup failure has unknown identity, even if its target is
+/// reported missing. This check observes filesystem state at decision time.
+fn resolve_write_path(path: &Path) -> Result<PathBuf, ()> {
+    let mut resolved = PathBuf::new();
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => resolved.push(component),
+            Component::CurDir => {}
+            Component::ParentDir if !missing => {
+                resolved.pop();
+            }
+            Component::ParentDir => return Err(()),
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing {
+                    continue;
+                }
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        resolved = std::fs::canonicalize(&resolved).map_err(|_| ())?;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(_) => return Err(()),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Configured path denies must run before configured command allows in

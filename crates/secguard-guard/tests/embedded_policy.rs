@@ -313,3 +313,40 @@ fn account_roots_and_directory_removal_cannot_be_approved_as_file_deletion() {
         Some(RuleId::RmTargetedFile)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn output_resolution_checks_existing_ancestors_and_directory_destinations() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(cwd.join("policy")).unwrap();
+    std::fs::create_dir(cwd.join("safe")).unwrap();
+    symlink("policy", cwd.join("alias")).unwrap();
+    symlink("missing", cwd.join("dangling")).unwrap();
+
+    let mut config = GuardConfig::default();
+    config.protected_policy_paths.push(cwd.join("policy/new"));
+    let check = |command| secguard_guard::check_detailed_in_dir(command, &config, &cwd);
+    for command in [
+        "echo sample > alias/new/settings",
+        "cp sample alias",
+        "install -t alias sample",
+        "ln --target-directory=alias sample",
+        "chmod -R u+rw alias",
+        "chown --recursive fixture alias",
+    ] {
+        assert_eq!(
+            check(command).rule_id,
+            Some(RuleId::GuardSelfApproval),
+            "{command}"
+        );
+    }
+    let unresolved = check("echo sample > dangling/settings");
+    assert_eq!(unresolved.action, Action::Block);
+    assert!(!unresolved.determinate);
+    assert_eq!(check("echo sample > safe/settings").action, Action::Allow);
+    assert_eq!(check("rg sample .").action, Action::Allow);
+    assert_eq!(check("cp alias safe").action, Action::Allow);
+}
