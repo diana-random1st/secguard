@@ -34,9 +34,10 @@ fn force_push_confirms() {
 }
 
 #[test]
-fn no_verify_warns() {
-    // NoVerify (1, 3) → Warn — low blast, easily reversible.
-    assert_eq!(action("git commit --no-verify -m x"), Action::Warn);
+fn no_verify_is_a_hard_deny() {
+    // NoVerify is a hard deny for embedded enforcement: an agent may not skip
+    // the repository's safety hooks, whatever its score.
+    assert_eq!(action("git commit --no-verify -m x"), Action::Block);
 }
 
 #[test]
@@ -54,8 +55,9 @@ fn safe_command_allows() {
 
 #[test]
 fn config_override_changes_action() {
-    // A user can downgrade a cell. Move (3, 0) [SaasDestroy/RmRf class] from
-    // Block to Warn and confirm the pipeline honours it.
+    // A user can downgrade a cell for an approval-eligible rule. Move (3, 0)
+    // [AwsS3Rm class] from Block to Warn and confirm the pipeline honours it.
+    // A hard deny in the same cell (RmRf) ignores the override.
     use secguard_guard::config::{ScoringConfig, ScoringOverride};
     let cfg = GuardConfig {
         scoring: ScoringConfig {
@@ -67,5 +69,13 @@ fn config_override_changes_action() {
         },
         ..Default::default()
     };
-    assert_eq!(check_detailed("rm -rf $HOME", &cfg).action, Action::Warn);
+    assert_eq!(
+        check_detailed("aws s3 rm s3://bucket/tmp/a.tgz", &GuardConfig::default()).action,
+        Action::Block
+    );
+    assert_eq!(
+        check_detailed("aws s3 rm s3://bucket/tmp/a.tgz", &cfg).action,
+        Action::Warn
+    );
+    assert_eq!(check_detailed("rm -rf $HOME", &cfg).action, Action::Block);
 }
