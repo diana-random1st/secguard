@@ -255,30 +255,6 @@ impl<'a> Walker<'a> {
         None
     }
 
-    /// The directory a `cd` target names, when it is known at parse time:
-    /// an absolute path, or an unquoted `~` / `~/path` resolved through
-    /// `lookup("HOME")`, so a rebinding of HOME earlier in the same command
-    /// wins and a tainted one stays unresolved. Paths with `..` are refused.
-    fn resolve_cd_target(&self, target: &str, unquoted_word: bool) -> Option<String> {
-        let path = if target.starts_with('/') {
-            target.to_string()
-        } else if unquoted_word && (target == "~" || target.starts_with("~/")) {
-            let home = self.lookup("HOME")?;
-            if !home.starts_with('/') {
-                return None;
-            }
-            let joined = format!("{}{}", home.trim_end_matches('/'), &target[1..]);
-            if joined.is_empty() {
-                "/".to_string()
-            } else {
-                joined
-            }
-        } else {
-            return None;
-        };
-        (!path.contains("..")).then_some(path)
-    }
-
     fn text(&self, node: Node<'_>) -> &'a str {
         node.utf8_text(self.src).unwrap_or("")
     }
@@ -803,9 +779,6 @@ impl<'a> Walker<'a> {
         chrooted: bool,
     ) {
         let mut argv: Vec<String> = Vec::new();
-        // Bash expands a leading `~` only in an unquoted word, so `cd`
-        // needs to know how its target was written.
-        let mut first_arg_unquoted_word = false;
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         // First pass: walk any nested command/process substitutions so
@@ -836,9 +809,6 @@ impl<'a> Walker<'a> {
                     // backslash escapes so the rules layer sees the
                     // bash-literal head, not the obfuscated source
                     // text (`$'rm'` and `\r\m` both → `rm`).
-                    if argv.len() == 1 {
-                        first_arg_unquoted_word = child.kind() == "word";
-                    }
                     argv.push(decode_token(self.text(*child)));
                 }
                 "string" | "raw_string" => {
@@ -1036,17 +1006,21 @@ impl<'a> Walker<'a> {
             return;
         }
 
-        // `cd <abs>` and an unquoted `cd ~` / `cd ~/path` update lexical
-        // cwd; emit nothing for cd itself. Any other target (`cd ..`,
-        // `cd subdir`, `cd -`, `cd "~/x"`, `cd ~user`, `cd $VAR`, bare
-        // `cd`) drops cwd to None — we cannot resolve the new directory
-        // at parse time and a stale cwd causes false safe verdicts
-        // (verified bypass: `cd /tmp; cd ..; rm -rf var` checks against
-        // /tmp/var rather than /var).
+        // `cd <abs>` updates lexical cwd; emit nothing for cd itself.
+        // Any non-absolute target (`cd ..`, `cd subdir`, `cd -`, `cd ~`,
+        // `cd $VAR`, bare `cd`) drops cwd to None — we cannot resolve
+        // the new directory at parse time and a stale cwd causes false
+        // safe verdicts (verified bypass: `cd /tmp; cd ..; rm -rf var`
+        // checks against /tmp/var rather than /var).
         if argv[0] == "cd" {
-            self.cwd = argv
-                .get(1)
-                .and_then(|target| self.resolve_cd_target(target, first_arg_unquoted_word));
+            match argv.get(1).map(String::as_str) {
+                Some(target) if target.starts_with('/') && !target.contains("..") => {
+                    self.cwd = Some(target.to_string());
+                }
+                _ => {
+                    self.cwd = None;
+                }
+            }
             return;
         }
 
@@ -2591,31 +2565,5 @@ mod tests {
             .iter()
             .any(|cmd| cmd.argv[0].starts_with("__") && cmd.argv[0].ends_with("__"));
         assert!(!bad, "trusted-env resolution shouldn't mark: {c:#?}");
-    }
-
-    #[test]
-    fn cd_tilde_sets_cwd_only_for_an_unquoted_home_path() {
-        let home = std::env::var("HOME").expect("HOME is set in tests");
-        let c = cmds("cd ~/proj && sed -n 1,5p notes.txt");
-        assert_eq!(c[0].cwd.as_deref(), Some(format!("{home}/proj").as_str()));
-        let c = cmds("cd ~ && sed -n 1,5p notes.txt");
-        assert_eq!(c[0].cwd.as_deref(), Some(home.as_str()));
-        for unresolved in [
-            "cd \"~/proj\" && sed -n 1,5p notes.txt",
-            "cd '~/proj' && sed -n 1,5p notes.txt",
-            "cd ~/../etc && sed -n 1,5p passwd",
-            "cd ~root && sed -n 1,5p notes.txt",
-            "cd proj && sed -n 1,5p notes.txt",
-        ] {
-            assert_eq!(cmds(unresolved)[0].cwd, None, "{unresolved}");
-        }
-    }
-
-    #[test]
-    fn cd_tilde_uses_a_home_rebound_in_the_same_command() {
-        let c = cmds("HOME=/etc; cd ~ && sed -n 1,5p passwd");
-        assert_eq!(c.last().unwrap().cwd.as_deref(), Some("/etc"));
-        let c = cmds("HOME=\"$(pwd)\"; cd ~ && sed -n 1,5p passwd");
-        assert_eq!(c.last().unwrap().cwd, None);
     }
 }
