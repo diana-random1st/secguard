@@ -493,14 +493,13 @@ fn nested_extra_readings_keep_hard_protections() {
         assert!(!detail.can_approve(), "{command}");
         detail
     };
-    assert!(
-        !hard(
-            &config,
-            r#"d='"'; s=' $'; bash -c "a=${d}sudo${s}'rm'${s}'-rf'${s}'/etc'${d}; bash <<EOF
+    // The decoded reading is peeled like argv, so this names the rm -rf
+    // /etc inside sudo: a hard deny where 99af962 had an unresolved block.
+    hard(
+        &config,
+        r#"d='"'; s=' $'; bash -c "a=${d}sudo${s}'rm'${s}'-rf'${s}'/etc'${d}; bash <<EOF
 ${s}a
 EOF""#,
-        )
-        .determinate
     );
     hard(
         &config,
@@ -591,4 +590,105 @@ fn cd_into_a_quoted_name_keeps_the_tracked_directory() {
         assert_eq!(detail.action, Action::Block, "{command}");
         assert!(!detail.can_approve(), "{command}");
     }
+}
+
+/// Gaps the quoting rounds left open (2026-11-24); each of these was Allow
+/// in e59056a.
+#[test]
+fn open_gaps_of_the_quoting_rounds_are_closed() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    let hard = |command: &str, cwd: Option<&str>| {
+        let detail = match cwd {
+            Some(cwd) => secguard_guard::check_detailed_in_dir(command, &config, Path::new(cwd)),
+            None => check_detailed(command, &config),
+        };
+        assert_eq!(detail.action, Action::Block, "{command} in {cwd:?}");
+        assert!(!detail.can_approve(), "{command} in {cwd:?}");
+    };
+    for command in [
+        // The decoded reading is peeled like argv.
+        "sudo rm $'-rf' $'/'",
+        "sudo $'rm' -rf /",
+        "timeout 5 rm $'-rf' $'/'",
+        "sudo -u root rm $'-rf' $'/etc'",
+        "nice rm $'-rf' $'/'",
+        // A backslash-newline inside a word.
+        "r\\\nm -rf /",
+        // zsh runs rm for `=rm`.
+        "=rm -rf /",
+        "sudo =rm -rf /",
+        "xargs =rm -rf < list",
+        // Case does not matter on a macOS volume.
+        "touch '/fixture/POLICY DIR/settings.toml'",
+        "touch '/fixture/policy dir/SETTINGS.toml'",
+    ] {
+        hard(command, None);
+    }
+    assert_ne!(
+        check_detailed("git reset --ha\\\nrd", &config).action,
+        Action::Allow
+    );
+    // A cd that fails leaves the shell where it was.
+    for command in [
+        "cd /tmp/missing; touch settings.toml",
+        "cd /tmp/missing || touch settings.toml",
+        "cd /tmp/missing\ntouch settings.toml",
+        "cd /tmp; cd /tmp/missing; touch settings.toml",
+        "cd /tmp/missing 2>/dev/null; touch settings.toml",
+    ] {
+        hard(command, Some("/fixture/policy dir"));
+    }
+    // Only the first cd succeeds.
+    hard(
+        "cd '/fixture/policy dir'; cd /tmp/missing; touch settings.toml",
+        Some("/fixture"),
+    );
+}
+
+/// A reading in which a cd failed skips what runs only after it succeeded,
+/// and the other readings change nothing for ordinary commands.
+#[test]
+fn other_readings_add_no_block_to_ordinary_commands() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    for command in [
+        "cd /tmp && touch settings.toml",
+        "cd /tmp && make && cd /tmp/x && touch settings.toml",
+        "cd /tmp && ls; cd /var && ls",
+        "echo =rm",
+        "git commit -m \"a \\\nb\"",
+        "ls \\\n  -la",
+        "echo $'hi'",
+        "sudo echo $'hi'",
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(
+            command,
+            &config,
+            Path::new("/fixture/policy dir"),
+        );
+        assert_eq!(detail.action, Action::Allow, "{command}");
+    }
+}
+
+/// Failed-cd readings multiply through nested bodies; past the walk budget
+/// the source is unresolved instead of keeping the guard walking.
+#[test]
+fn nested_cd_readings_stop_at_the_walk_budget() {
+    let cds = (0..16)
+        .map(|i| format!("cd /d{i}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let command = format!("{cds}; bash -c '{cds}; bash -c \"{cds}; ls\"'");
+    let detail = check_detailed(&command, &GuardConfig::default());
+    assert_eq!(detail.action, Action::Block);
+    assert!(!detail.determinate);
 }

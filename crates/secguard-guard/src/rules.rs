@@ -330,7 +330,11 @@ fn protected_policy_path(
             _ => normalized.push(component),
         }
     }
+    // macOS volumes ignore case by default: `/x/POLICY DIR/settings.toml`
+    // is the protected `/x/policy dir/settings.toml`. Both sides are folded
+    // on every platform; an exact match still matches.
     let names_match = |path: &Path| {
+        let path = fold_case(path);
         path.components().any(|component| {
             component.as_os_str().to_str().is_some_and(|name| {
                 matches!(
@@ -341,10 +345,12 @@ fn protected_policy_path(
         }) || path.ends_with("secguard/config.toml")
     };
     let explicit_match = |path: &Path| {
+        let path = fold_case(path);
         config.protected_policy_paths.iter().any(|protected| {
+            let protected = fold_case(protected);
             protected.is_absolute()
-                && (path.starts_with(protected)
-                    || writes_directories && protected.starts_with(path))
+                && (path.starts_with(&protected)
+                    || writes_directories && protected.starts_with(&path))
         })
     };
     if names_match(candidate) || names_match(&normalized) || explicit_match(&normalized) {
@@ -355,6 +361,17 @@ fn protected_policy_path(
     }
     let resolved = resolve_write_path(&path)?;
     Ok(names_match(&resolved) || explicit_match(&resolved))
+}
+
+/// The path with every component lowercased; a component that is not UTF-8
+/// stays as it is.
+fn fold_case(path: &Path) -> PathBuf {
+    path.components()
+        .map(|component| match component.as_os_str().to_str() {
+            Some(name) => std::ffi::OsString::from(name.to_lowercase()),
+            None => component.as_os_str().to_os_string(),
+        })
+        .collect()
 }
 
 /// Canonicalize the existing prefix, retaining a missing suffix for new outputs.

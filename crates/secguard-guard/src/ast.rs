@@ -13,7 +13,9 @@
 //! This module owns the first three steps. Rules in [`crate::rules`]
 //! consume the resulting [`EffectiveCommand`] stream as pure predicates.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -107,6 +109,17 @@ pub struct ParseResult {
     pub(crate) extra_readings: usize,
 }
 
+impl ParseResult {
+    fn failed() -> Self {
+        Self {
+            commands: Vec::new(),
+            had_error: true,
+            raw_allow_eligible: false,
+            extra_readings: 0,
+        }
+    }
+}
+
 /// Parse a raw bash command. Always returns a list of commands (possibly
 /// empty) and a flag indicating whether the parse hit any error nodes.
 pub fn parse(source: &str) -> ParseResult {
@@ -114,30 +127,203 @@ pub fn parse(source: &str) -> ParseResult {
 }
 
 pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
+    let _outermost = OutermostParse::enter();
+    let (mut result, cds) = walk_source(source, cwd, false);
+    // Readings the walk does not model are classified as extra commands, so
+    // a verdict can only get stricter.
+    // A command the walk already holds is classified the same way again, so
+    // only new ones are kept.
+    for command in other_readings(source, cwd, &cds)
+        .into_iter()
+        .flat_map(|reading| reading.commands)
+    {
+        if !result.commands.contains(&command) {
+            result.raw_allow_eligible = false;
+            result.extra_readings += 1;
+            result.commands.push(command);
+        }
+    }
+    result
+}
+
+/// Stands in for a `cd` that failed: a word no program is named, which the
+/// walk of a failed-`cd` reading drops.
+const CD_FAILED: &str = "__secguard_cd_failed__";
+
+/// More `cd` commands than this in one source get an indirect marker instead
+/// of one failed-`cd` reading each.
+const MAX_CD_READINGS: usize = 16;
+
+/// Walks of other readings one outermost parse may spend. Readings multiply
+/// through nested bodies (`bash -c` inside `bash -c`, each with its own
+/// `cd` commands), so a crafted source could keep the guard walking for
+/// minutes; past this, the source gets an indirect marker.
+const MAX_READING_WALKS: usize = 256;
+
+thread_local! {
+    /// What is left of [`MAX_READING_WALKS`] for the outermost parse running
+    /// on this thread; `None` between parses.
+    static READING_WALKS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Opens the walk budget for the outermost parse and closes it when that
+/// parse ends, also when it unwinds.
+struct OutermostParse(bool);
+
+impl OutermostParse {
+    fn enter() -> Self {
+        Self(READING_WALKS.with(|walks| {
+            let outermost = walks.get().is_none();
+            if outermost {
+                walks.set(Some(MAX_READING_WALKS));
+            }
+            outermost
+        }))
+    }
+}
+
+impl Drop for OutermostParse {
+    fn drop(&mut self) {
+        if self.0 {
+            READING_WALKS.with(|walks| walks.set(None));
+        }
+    }
+}
+
+/// Takes one walk from the budget; `false` once it is spent.
+fn take_reading_walk() -> bool {
+    READING_WALKS.with(|walks| match walks.get() {
+        Some(left) if left > 0 => {
+            walks.set(Some(left - 1));
+            true
+        }
+        _ => false,
+    })
+}
+
+/// A reading that only holds an indirect marker for `source`.
+fn unresolved_reading(source: &str, cwd: Option<&str>) -> ParseResult {
+    ParseResult {
+        commands: vec![EffectiveCommand {
+            argv: vec!["__indirect_unresolved__".to_string(), source.to_string()],
+            cwd: cwd.map(str::to_owned),
+            span: SpanKind::Executed,
+            wrappers: Vec::new(),
+            remote: false,
+            chrooted: false,
+        }],
+        had_error: false,
+        raw_allow_eligible: false,
+        extra_readings: 0,
+    }
+}
+
+/// The readings of `source` the walk itself does not model.
+///
+/// * A backslash-newline is dropped before the shell splits words, so
+///   `r\<newline>m -rf /` runs `rm`, where tree-sitter splits the word in two.
+///   The source is parsed once more with every backslash-newline removed,
+///   also inside single quotes, where the shell keeps it.
+/// * The walk assumes that every `cd` succeeds. After `cd /missing; touch f`
+///   the shell is still where it was and writes `f` there. An absolute `cd`
+///   replaces the whole directory, so a later command runs either where the
+///   source started or in the target of the last `cd` that succeeded: the
+///   reading in which every `cd` fails and the readings in which exactly one
+///   succeeds cover every such directory.
+fn other_readings(source: &str, cwd: Option<&str>, cds: &[Range<usize>]) -> Vec<ParseResult> {
+    let mut readings = Vec::new();
+    if source.contains("\\\n") {
+        if !take_reading_walk() {
+            readings.push(unresolved_reading(source, cwd));
+            return readings;
+        }
+        readings.push(parse_with_cwd(&source.replace("\\\n", ""), cwd));
+    }
+    if cds.len() > MAX_CD_READINGS {
+        readings.push(unresolved_reading(source, cwd));
+        return readings;
+    }
+    let all: Vec<usize> = (0..cds.len()).collect();
+    let mut failing_sets = Vec::new();
+    if !cds.is_empty() {
+        failing_sets.push(all.clone());
+    }
+    if cds.len() > 1 {
+        for succeeds in 0..cds.len() {
+            failing_sets.push(all.iter().copied().filter(|&i| i != succeeds).collect());
+        }
+    }
+    for failing in failing_sets {
+        if !take_reading_walk() {
+            readings.push(unresolved_reading(source, cwd));
+            break;
+        }
+        let ranges: Vec<&Range<usize>> = failing.iter().map(|&i| &cds[i]).collect();
+        let text = replace_ranges(source, &ranges, CD_FAILED);
+        readings.push(walk_source(&text, cwd, true).0);
+    }
+    readings
+}
+
+/// `source` with each range replaced by `with`. A range inside another one
+/// that is replaced goes with it.
+fn replace_ranges(source: &str, ranges: &[&Range<usize>], with: &str) -> String {
+    let mut outer: Vec<&Range<usize>> = ranges
+        .iter()
+        .copied()
+        .filter(|range| {
+            !ranges
+                .iter()
+                .any(|other| other != range && other.start <= range.start && range.end <= other.end)
+        })
+        .collect();
+    outer.sort_by_key(|range| std::cmp::Reverse(range.start));
+    let mut text = source.to_string();
+    for range in outer {
+        text.replace_range(range.clone(), with);
+    }
+    text
+}
+
+/// The byte ranges of every `cd` command in the tree.
+fn cd_commands(node: Node<'_>, bytes: &[u8]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut cursor = node.walk();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| name.utf8_text(bytes) == Ok("cd"))
+        {
+            found.push(node.byte_range());
+        }
+        stack.extend(node.children(&mut cursor));
+    }
+    found
+}
+
+/// Walk one reading of `source`; also returns the `cd` commands in it.
+fn walk_source(
+    source: &str,
+    cwd: Option<&str>,
+    cd_fails: bool,
+) -> (ParseResult, Vec<Range<usize>>) {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .is_err()
     {
-        return ParseResult {
-            commands: Vec::new(),
-            had_error: true,
-            raw_allow_eligible: false,
-            extra_readings: 0,
-        };
+        return (ParseResult::failed(), Vec::new());
     }
     let Some(tree) = parser.parse(source, None) else {
-        return ParseResult {
-            commands: Vec::new(),
-            had_error: true,
-            raw_allow_eligible: false,
-            extra_readings: 0,
-        };
+        return (ParseResult::failed(), Vec::new());
     };
 
     let bytes = source.as_bytes();
     let mut walker = Walker::new(bytes);
     walker.cwd = cwd.map(str::to_owned);
+    walker.cd_fails = cd_fails;
     walker.walk_program(tree.root_node());
 
     let root = tree.root_node();
@@ -148,12 +334,14 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
         && walker.commands.len() == 1
         && walker.commands[0].wrappers.is_empty();
 
-    ParseResult {
+    let cds = cd_commands(root, bytes);
+    let result = ParseResult {
         raw_allow_eligible,
         extra_readings: walker.extra_readings,
         commands: walker.commands,
         had_error: tree_has_error(&tree),
-    }
+    };
+    (result, cds)
 }
 
 /// A raw allow vouches for exactly one unwrapped, literal shell invocation.
@@ -171,8 +359,8 @@ fn simple_literal_command(node: Node<'_>, bytes: &[u8]) -> bool {
     simple
 }
 
-/// The decoded reading is classified as a flat command: it is not
-/// unwrapped, re-parsed as a shell body or tracked as a cd. It cannot stand
+/// A decoded reading is not re-parsed as a shell body or tracked as a cd,
+/// and a decoded program name is not unwrapped like argv's. It cannot stand
 /// for the command when what it decodes is a wrapper the walker would
 /// unwrap (`'sudo' rm`, `"bash" -c`, `'eval'`, `'find' -delete`), a
 /// directory change (`"cd"`, or `cd /x/'policy dir'` whose target needed
@@ -281,6 +469,23 @@ fn decoded_reading(node: Node<'_>, bytes: &[u8]) -> Reading {
         "translated_string" | "brace_expression" => Reading::Opaque,
         _ => Reading::Same,
     }
+}
+
+/// zsh expands a word `=rm` to the path of `rm` (option EQUALS, on by
+/// default), so `=rm -rf /` and `sudo =rm -rf /` run rm. Bash runs a program
+/// named `=rm`, which does not exist.
+fn zsh_equals(child: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let word = match child.kind() {
+        "word" => child,
+        "command_name" => child.named_child(0).filter(|name| name.kind() == "word")?,
+        _ => return None,
+    };
+    let name = word.utf8_text(bytes).ok()?.strip_prefix('=')?;
+    let program = name.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'));
+    program.then(|| name.to_string())
 }
 
 /// The word a run of literal parts passes to the program, or `None` when any
@@ -425,6 +630,10 @@ struct Walker<'a> {
     /// Extra decoded readings pushed into `commands`, including those taken
     /// over from nested re-parses (see [`ParseResult::extra_readings`]).
     extra_readings: usize,
+    /// This walk is a reading in which some `cd` commands failed: they were
+    /// replaced by [`CD_FAILED`], which runs nothing, and `&&` after one
+    /// skips its right side (see [`other_readings`]).
+    cd_fails: bool,
 }
 
 /// Names we trust to resolve from process env at parse time.
@@ -448,6 +657,7 @@ impl<'a> Walker<'a> {
             cwd: None,
             bindings: HashMap::new(),
             extra_readings: 0,
+            cd_fails: false,
         }
     }
 
@@ -475,6 +685,99 @@ impl<'a> Walker<'a> {
 
     fn text(&self, node: Node<'_>) -> &'a str {
         node.utf8_text(self.src).unwrap_or("")
+    }
+
+    /// Classify `reading`, another way the shell may read `argv`, as extra
+    /// commands; returns whether what it runs stays unknown.
+    ///
+    /// The reading is classified as a flat command and, like argv below,
+    /// peeled of the wrappers around it, so `sudo rm $'-rf' $'/'` is read as
+    /// `rm -rf /` inside sudo. It is not re-parsed as a shell body or tracked
+    /// as a cd: a decoded program that is one of those (`'sudo' rm`,
+    /// `"bash" -c`, `'eval'`, `"cd"`), a body to re-parse (`sudo bash -c
+    /// $'rm -rf /'`) or a shell reading its script from stdin is opaque.
+    fn push_reading(
+        &mut self,
+        argv: &[String],
+        reading: &[String],
+        wrappers: &[Wrapper],
+        remote: bool,
+        chrooted: bool,
+    ) -> bool {
+        if reading == argv || reading.is_empty() {
+            return false;
+        }
+        let mut opaque = dispatches(argv, reading);
+        let mut peeled = reading.to_vec();
+        let mut chain = wrappers.to_vec();
+        let (mut peeled_remote, mut peeled_chrooted) = (remote, chrooted);
+        while let Some((wrapper, inner, r, c, body)) = unwrap_wrapper(&peeled) {
+            if body.is_some() {
+                opaque = true;
+            }
+            if body.is_some() || inner.is_empty() {
+                break;
+            }
+            chain.push(wrapper);
+            peeled_remote |= r;
+            peeled_chrooted |= c;
+            peeled = inner;
+        }
+        if peeled != reading {
+            if peeled.first().is_some_and(|head| {
+                matches!(
+                    basename(head),
+                    "bash" | "sh" | "zsh" | "ksh" | "dash" | "fish"
+                )
+            }) {
+                opaque = true;
+            }
+            self.extra_readings += 1;
+            self.commands.push(EffectiveCommand {
+                argv: peeled,
+                cwd: self.cwd.clone(),
+                span: SpanKind::Executed,
+                wrappers: chain,
+                remote: peeled_remote,
+                chrooted: peeled_chrooted,
+            });
+        }
+        self.extra_readings += 1;
+        self.commands.push(EffectiveCommand {
+            argv: reading.to_vec(),
+            cwd: self.cwd.clone(),
+            span: SpanKind::Executed,
+            wrappers: wrappers.to_vec(),
+            remote,
+            chrooted,
+        });
+        opaque
+    }
+
+    /// `left && right` whose left side cannot succeed in this reading.
+    fn left_of_and_fails(&self, list: Node<'_>) -> bool {
+        let mut cursor = list.walk();
+        let and = list.children(&mut cursor).any(|child| child.kind() == "&&");
+        and && list
+            .named_child(0)
+            .is_some_and(|left| self.always_fails(left))
+    }
+
+    /// A failed `cd`, alone, redirected or ahead of more `&&`.
+    fn always_fails(&self, node: Node<'_>) -> bool {
+        match node.kind() {
+            "command" => {
+                node.named_child_count() == 1
+                    && node
+                        .child_by_field_name("name")
+                        .is_some_and(|name| self.text(name) == CD_FAILED)
+            }
+            "redirected_statement" => node
+                .child_by_field_name("body")
+                .is_some_and(|body| self.always_fails(body)),
+            "list" => self.left_of_and_fails(node),
+            _ => false,
+        }
     }
 
     /// Top-level walk: a `program` node has any number of child
@@ -509,6 +812,14 @@ impl<'a> Walker<'a> {
             }
             "pipeline" => {
                 self.handle_pipeline(node, wrappers, remote, chrooted);
+            }
+            // In a reading where a `cd` failed, `cd X && rest` runs nothing
+            // after `&&`: without this, `cd build && rm -rf *` would be read
+            // as `rm -rf *` where the source started.
+            "list" if self.cd_fails && self.left_of_and_fails(node) => {
+                if let Some(left) = node.named_child(0) {
+                    self.walk_node(left, wrappers, remote, chrooted);
+                }
             }
             "redirected_statement" => {
                 // `bash <<EOF\nrm -rf /\nEOF` arrives as
@@ -1034,9 +1345,12 @@ impl<'a> Walker<'a> {
         // cannot be decoded sets `opaque`, which adds an indirect marker: a
         // non-approvable, indeterminate block.
         let mut reading: Vec<String> = Vec::new();
+        // The same reading as zsh expands `=rm` in it.
+        let mut equals: Vec<String> = Vec::new();
         let mut opaque = false;
         for child in &children {
             let before = argv.len();
+            let reading_before = reading.len();
             let child_reading = decoded_reading(*child, self.src);
             let same = matches!(child_reading, Reading::Same);
             match child_reading {
@@ -1093,24 +1407,16 @@ impl<'a> Walker<'a> {
             if same {
                 reading.extend(argv[before..].iter().cloned());
             }
+            match zsh_equals(*child, self.src) {
+                Some(program) => equals.push(program),
+                None => equals.extend(reading[reading_before..].iter().cloned()),
+            }
         }
-        // The decoded reading is classified as a flat command: it is not
-        // unwrapped, re-parsed as a shell body or tracked as a cd. When the
-        // decoded program is one of those (`'sudo' rm`, `"bash" -c`,
-        // `'eval'`, `"cd"`), what it runs stays unknown.
-        if reading != argv && !reading.is_empty() && dispatches(&argv, &reading) {
-            opaque = true;
-        }
-        if reading != argv && !reading.is_empty() {
-            self.extra_readings += 1;
-            self.commands.push(EffectiveCommand {
-                argv: reading,
-                cwd: self.cwd.clone(),
-                span: SpanKind::Executed,
-                wrappers: wrappers.to_vec(),
-                remote,
-                chrooted,
-            });
+        opaque |= self.push_reading(&argv, &reading, wrappers, remote, chrooted);
+        // A separate reading, so that `=echo 'policy dir'/x` keeps what the
+        // decoded reading alone gives it (an unknown program writing there).
+        if equals != reading {
+            opaque |= self.push_reading(&argv, &equals, wrappers, remote, chrooted);
         }
         if opaque {
             // An extra command like the decoded reading: it must not count
@@ -1195,7 +1501,7 @@ impl<'a> Walker<'a> {
             }
         }
 
-        if argv.is_empty() {
+        if argv.is_empty() || self.cd_fails && argv[0] == CD_FAILED {
             return;
         }
 
