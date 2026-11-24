@@ -136,3 +136,29 @@ fn brain_does_not_return_malformed_on_simple_command() {
         other => panic!("`ls` must reach the brain path and return a valid label — got {other:?}"),
     }
 }
+
+/// Accepted policy (2026-11-24): an obfuscated spelling takes the verdict of
+/// the plain one. With the brain compiled in, a decoded reading that hits a
+/// heuristic rule returns that rule, as the plain command does, instead of
+/// the argv-only stream reaching the brain fallback.
+#[test]
+fn obfuscated_spelling_takes_the_plain_verdict() {
+    if !model_present() {
+        eprintln!("[skip] secguard-guard.gguf not installed");
+        return;
+    }
+    let cfg = GuardConfig::default();
+    for (obfuscated, plain) in [
+        ("git reset $'--hard'", "git reset --hard"),
+        ("git reset ''--hard", "git reset --hard"),
+        ("'r'm -rf /var", "rm -rf /var"),
+        ("sudo rm $'-rf' $'/var'", "sudo rm -rf /var"),
+        ("=rm -rf /var", "rm -rf /var"),
+    ] {
+        let o = check_detailed(obfuscated, &cfg);
+        let p = check_detailed(plain, &cfg);
+        assert_eq!(o.action, p.action, "{obfuscated}");
+        assert_eq!(o.rule_id, p.rule_id, "{obfuscated}");
+        assert_eq!(o.source, p.source, "{obfuscated}");
+    }
+}
