@@ -230,6 +230,7 @@ mod tests {
             wrappers: vec![],
             remote: false,
             chrooted: false,
+            literal: Vec::new(),
         }
     }
 
