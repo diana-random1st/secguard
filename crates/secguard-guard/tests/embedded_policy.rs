@@ -692,3 +692,286 @@ fn nested_cd_readings_stop_at_the_walk_budget() {
     assert_eq!(detail.action, Action::Block);
     assert!(!detail.determinate);
 }
+
+/// A word the shell may expand, a HOME that may have been rebound before a
+/// tilde cd (the 99af962 repros), and git options
+/// that can run code stay unresolved; a protected write stays blocked through
+/// each new path.
+#[test]
+fn unknown_words_rebound_home_and_protected_writes_stay_blocked() {
+    use std::path::Path;
+
+    let home = std::env::var("HOME").expect("HOME");
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    config
+        .protected_policy_paths
+        .push(format!("{home}/secguard-fixture/settings.toml").into());
+    for command in [
+        "sed -i s/a/b/ $F",
+        "cp a *.txt",
+        "tee \"$OUT\"",
+        "cp a \"b\\$x\"",
+        "git -C \"$X\" -c core.pager=x log",
+        "git -C \"$X\" --work-tree=/ log",
+        "git -C \"$X\" log --output=x",
+        // 99af962: HOME rebound in ways the walker does not model.
+        "read -r HOME <<< /x; cd ~ && cp evil config.toml",
+        "builtin export H\\OME=/x; cd ~ && cp evil config.toml",
+        "HOME=/x; cd ~ && touch config.toml",
+        "export HOME=/x && cd ~ && touch config.toml",
+        "printf -v HOME /x; cd ~ && touch config.toml",
+        "print -v HOME /x; cd ~ && touch config.toml",
+        "eval 'HO''ME=/x'; cd ~ && touch config.toml",
+        "declare HOME=/x; cd ~ && touch config.toml",
+        "\\read HOME; cd ~ && touch config.toml",
+        "vared HOME; cd ~ && touch config.toml",
+        "f() { :; }; cd ~ && touch config.toml",
+        "env HO\\ME=/x bash -c 'cd ~ && touch config.toml'",
+        "echo 'cd ~ && touch config.toml' | HOME=/x bash",
+        // Protected writes through the new paths.
+        "sed -i 's/a*/b/' '/fixture/policy dir/settings.toml'",
+        "echo x > '/fixture/policy dir/settings.toml'",
+        "cd ~/secguard-fixture && touch settings.toml",
+        "cd /fixture/'policy dir' && touch settings.toml",
+    ] {
+        let detail =
+            secguard_guard::check_detailed_in_dir(command, &config, Path::new("/tmp/secguard-cwd"));
+        assert_eq!(detail.action, Action::Block, "{command}");
+        assert!(!detail.can_approve(), "{command}");
+    }
+}
+
+/// A cd inside a nested shell body that the walker cannot resolve leaves that
+/// body's directory unknown. Before, the enclosing directory was put back, so
+/// from a subdirectory of the protected one `bash -c 'cd .. && touch
+/// settings.toml'` was checked as a write to the subdirectory and allowed.
+#[test]
+fn an_unresolved_cd_in_a_nested_body_keeps_its_directory_unknown() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    for command in [
+        "bash -c 'cd .. && touch settings.toml'",
+        "echo 'cd .. && touch settings.toml' | bash",
+        "bash <<EOF\ncd .. && touch settings.toml\nEOF",
+        "sh -c 'cd ~ && cd .. && touch settings.toml'",
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(
+            command,
+            &config,
+            Path::new("/fixture/policy dir/sub"),
+        );
+        assert_eq!(detail.action, Action::Block, "{command}");
+        assert!(!detail.can_approve(), "{command}");
+    }
+}
+
+/// Found while reviewing a change that relaxed verdicts (round one,
+/// 2026-11-25): each of
+/// these was Allow in contextual mode on the first version of the change.
+#[test]
+fn word_literalness_round_one_repros_stay_blocked() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    let mut lockdown = config.clone();
+    lockdown.lockdown.enabled = true;
+    for command in [
+        // F1: a quoted builtin keeps its quote marks in argv.
+        "'export' H\\OME='/fixture/policy dir' && cd ~ && touch settings.toml",
+        "\"export\" H\\OME='/fixture/policy dir' && cd ~ && touch settings.toml",
+        "'printf' -v H\\OME '/fixture/policy dir' && cd ~ && touch settings.toml",
+        "echo '/fixture/policy dir' | 'read' -r H\\OME; cd ~ && touch settings.toml",
+        "'noglob' export H\\OME='/fixture/policy dir' && cd ~ && touch settings.toml",
+        // F2: zsh repeat, [[ ]] arithmetic, bash wait -p.
+        "repeat 1 export H\\OME='/fixture/policy dir'; cd ~ && touch settings.toml",
+        "[[ 0 -eq HOME=0 ]] && cd ~ && touch settings.toml",
+        "wait -p H\\OME; cd ~ && touch settings.toml",
+        // F3: a git -C value or argument that splits or expands.
+        "git -C $(echo . -c core.fsmonitor=/tmp/evil.sh) status",
+        "X='. -c core.fsmonitor=/tmp/evil.sh'; git -C $X status",
+        "git -C * status",
+        "OUT='--output=/fixture/policy dir/settings.toml'; git -C /tmp log \"$OUT\"",
+        "OUT='--output=/fixture/policy dir/settings.toml'; git log \"$OUT\"",
+        // F4: git expands pathspec globs itself.
+        "git restore 'policy dir/settings.*'",
+        "git rm 'policy dir/settings.*'",
+        "git restore ':(glob)**/settings.toml'",
+        "git checkout -- 'policy dir/settings.*'",
+        "git clean -fd 'policy dir/settings.*'",
+        // F5: wrappers that substitute or re-evaluate words.
+        "echo '/fixture/policy dir/settings.toml' | xargs -I '{}' cp evil '{}'",
+        "echo '/fixture/policy dir/settings.toml' | parallel cp evil '{}'",
+        "watch touch '$TARGET'",
+        // F6: zsh expands $~X, $^X and $=X inside double quotes.
+        "X='/fixture/policy dir/settings.toml'; touch \"$~X\"",
+        "X='/fixture/policy dir/settings.toml'; echo evil > \"$~X\"",
+        "X='/../fixture/policy dir'; cd /tmp/\"$~X\" && touch settings.toml",
+        "X='../fixture/policy dir'; cd /tmp/$X && touch settings.toml",
+    ] {
+        for (label, config) in [("contextual", &config), ("lockdown", &lockdown)] {
+            let detail =
+                secguard_guard::check_detailed_in_dir(command, config, Path::new("/fixture"));
+            assert_eq!(detail.action, Action::Block, "{label}: {command}");
+            assert!(!detail.can_approve(), "{label}: {command}");
+        }
+    }
+}
+
+/// Found while reviewing a change that relaxed verdicts (round two,
+/// 2026-11-25): parser
+/// gaps the change widened, each a real protected write in zsh and bash.
+#[test]
+fn word_literalness_round_two_repros_stay_blocked() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    for (cwd, command) in [
+        // A1: a comment ending in a backslash does not continue; the next
+        // line's continuations do.
+        (
+            "/fixture",
+            "# \\\nH\\\nOME='/fixture/policy dir'; cd ~ && touch settings.toml",
+        ),
+        (
+            "/fixture",
+            "# \\\nex\\\nport H\\OME='/fixture/policy dir'; cd ~ && touch settings.toml",
+        ),
+        (
+            "/fixture",
+            "# \\\ngit -C \"$X\" log --\\\noutput=/fixture/policy\\ dir/settings.toml",
+        ),
+        (
+            "/fixture",
+            "# \\\ngit log --\\\noutput=/fixture/policy\\ dir/settings.toml",
+        ),
+        // A2: tree-sitter splits a quote glued to a backslash word.
+        (
+            "/fixture",
+            "git -C \"$X\" log '--'\\output=/fixture/policy\\ dir/settings.toml",
+        ),
+        (
+            "/fixture",
+            "git log '--'\\output=/fixture/policy\\ dir/settings.toml",
+        ),
+        ("/fixture", "echo x > '/fixture/policy dir/'\\settings.toml"),
+        (
+            "/fixture",
+            "cd '/fixture/policy dir/sub/'\\.. && touch settings.toml",
+        ),
+        // A3: an escaped cd name still fails like cd.
+        (
+            "/fixture/policy dir",
+            "\\cd ~/nonexistent; touch settings.toml",
+        ),
+        (
+            "/fixture/policy dir",
+            "c\\d /nonexistent/'x'; touch settings.toml",
+        ),
+        (
+            "/fixture/policy dir",
+            "\\cd /nonexistent; touch settings.toml",
+        ),
+        // A4: zsh's two-argument cd substitutes in $PWD.
+        (
+            "/fixture/safe",
+            "cd /fixture/safe '/fixture/policy dir' && touch settings.toml",
+        ),
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(command, &config, Path::new(cwd));
+        assert_eq!(detail.action, Action::Block, "{cwd}: {command}");
+        assert!(!detail.can_approve(), "{cwd}: {command}");
+    }
+}
+
+/// Found while reviewing a change that relaxed verdicts (round three,
+/// 2026-11-25): each a
+/// real protected write or hard deny in zsh or bash.
+#[test]
+fn word_literalness_round_three_repros_stay_blocked() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    for (cwd, command) in [
+        // zsh test -v evaluates the subscript: HOME=7.
+        ("/fixture", "ln -s '/fixture/policy dir' 7; test -v 'path[HO''ME=7]'; cd ~ && echo x > settings.toml"),
+        // tree-sitter ends $'\\' at the last quote, bash after `\\`.
+        ("/fixture", "cd /tmp/$'\\\\';echo x > ''/fixture/policy\\ dir/settings.toml;#'"),
+        ("/fixture", "cd /tmp/$'\\\\';rm ''-rf /;#'"),
+        ("/fixture", "echo /tmp/$'\\\\';touch ''/fixture/policy\\ dir/settings.toml;#'"),
+        // An ANSI-C string glued to a backslash word.
+        ("/fixture", "git -C \"$X\" log $'--'\\output=/fixture/policy\\ dir/settings.toml"),
+        ("/fixture", "touch $'/fixture/policy dir/settings'\\.toml"),
+        // A line starting with an escaped name is its own command.
+        ("/fixture", "echo hi\n\\export H\\OME='/fixture/policy dir'\ncd ~ && touch settings.toml"),
+        ("/fixture", "echo hi\n\\touch '/fixture/policy dir/settings.toml'"),
+        // `#` after an escaped blank is text, not a comment.
+        ("/fixture", "echo \\ #; export HOME='/fixture/policy dir'\ncd ~ && touch settings.toml"),
+        ("/fixture", "echo \\ #; touch '/fixture/policy dir/settings.toml'"),
+        // Substitutions inside $(( )) and ${...} run.
+        ("/fixture", "cd /fixture/'safe' $(( $(rm -rf /) ))"),
+        ("/fixture", "git -C \"$X\" log $(( $(rm -rf /) ))"),
+        ("/fixture", "echo $(( $(rm -rf /) ))"),
+        ("/fixture", "echo ${X:-$(rm -rf /)}"),
+        // zsh cd OLD NEW with a blank-led NEW.
+        ("/fixture/policy/foo", "cd /foo ' dir' && sed -i 's/a*/b/' settings.toml"),
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(command, &config, Path::new(cwd));
+        assert_eq!(detail.action, Action::Block, "{cwd}: {command}");
+        assert!(!detail.can_approve(), "{cwd}: {command}");
+    }
+    // A backslash-newline the shell keeps, or no continuation at all, adds
+    // no reading and no block.
+    for command in [
+        "echo 'a\\\nb'",
+        "# \\\necho hi",
+        "echo \\\\\necho hi",
+        "cat <<'EOF'\nfoo\\\nbar\nEOF",
+        "sleep $((5*60))",
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(command, &config, Path::new("/fixture"));
+        assert_eq!(detail.action, Action::Allow, "{command}");
+    }
+}
+
+/// Found while reviewing a change that relaxed verdicts (round four,
+/// 2026-11-25): shapes tree-sitter misreads, or zsh features that rebind
+/// HOME.
+#[test]
+fn word_literalness_round_four_repros_stay_blocked() {
+    use std::path::Path;
+
+    let mut config = GuardConfig::default();
+    config
+        .protected_policy_paths
+        .push("/fixture/policy dir/settings.toml".into());
+    for (cwd, command) in [
+        ("/fixture", "ln -s '/fixture/policy dir' 7; : < \"/dev/null$~0[HOME=7]\"; cd ~ && touch settings.toml"),
+        ("/fixture", "ln -s '/fixture/policy dir' 7; cd \"/nonexistent/$~0[$(echo HO)ME=7]\"; cd ~ && touch settings.toml"),
+        ("/fixture", "ln -s 'policy dir' 'Operation not permitted'; syserror -e H\\OME 1; cd ~ && touch settings.toml"),
+        ("/fixture", "sed -i 's/a*/b/' '/fixture/policy'\\ dir/settings.toml"),
+        ("/fixture/work/sub", "cd /sub \u{a0} && sed -i 's/a*/b/' settings.toml"),
+        ("/fixture/safe", "'c'\\d '/fixture/policy dir' && sed -i 's/a*/b/' settings.toml"),
+        ("/fixture", "git -C \"$X\" log \u{b}#; touch '/fixture/policy dir/settings.toml'"),
+        ("/fixture", "git -C \"$X\" log < $'\\\\';touch ''/fixture/policy\\ dir/settings.toml;#'"),
+    ] {
+        let detail = secguard_guard::check_detailed_in_dir(command, &config, Path::new(cwd));
+        assert_eq!(detail.action, Action::Block, "{cwd}: {command}");
+        assert!(!detail.can_approve(), "{cwd}: {command}");
+    }
+}

@@ -77,9 +77,18 @@ pub struct EffectiveCommand {
     pub wrappers: Vec<Wrapper>,
     pub remote: bool,
     pub chrooted: bool,
+    /// One flag per `argv` word: true when the shell passes the word exactly
+    /// as argv holds it (no expansion, globbing or splitting at run time).
+    /// A missing flag means not literal.
+    pub literal: Vec<bool>,
 }
 
 impl EffectiveCommand {
+    /// Whether `argv[index]` is a word the shell leaves as written.
+    pub fn is_literal(&self, index: usize) -> bool {
+        self.literal.get(index).copied().unwrap_or(false)
+    }
+
     pub fn head(&self) -> Option<&str> {
         self.argv.first().map(String::as_str)
     }
@@ -127,13 +136,16 @@ pub fn parse(source: &str) -> ParseResult {
 }
 
 pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
+    parse_reading(source, cwd)
+}
+
+fn parse_reading(source: &str, cwd: Option<&str>) -> ParseResult {
     let _outermost = OutermostParse::enter();
-    let (mut result, cds) = walk_source(source, cwd, false);
+    let (mut result, cds, joined) = walk_source(source, cwd, false);
     // Readings the walk does not model are classified as extra commands, so
-    // a verdict can only get stricter.
-    // A command the walk already holds is classified the same way again, so
-    // only new ones are kept.
-    for command in other_readings(source, cwd, &cds)
+    // a verdict can only get stricter. A command the walk already holds is
+    // classified the same way again, so only new ones are kept.
+    for command in other_readings(source, cwd, &cds, joined.as_deref())
         .into_iter()
         .flat_map(|reading| reading.commands)
     {
@@ -211,6 +223,7 @@ fn unresolved_reading(source: &str, cwd: Option<&str>) -> ParseResult {
             wrappers: Vec::new(),
             remote: false,
             chrooted: false,
+            literal: Vec::new(),
         }],
         had_error: false,
         raw_allow_eligible: false,
@@ -230,14 +243,29 @@ fn unresolved_reading(source: &str, cwd: Option<&str>) -> ParseResult {
 ///   source started or in the target of the last `cd` that succeeded: the
 ///   reading in which every `cd` fails and the readings in which exactly one
 ///   succeeds cover every such directory.
-fn other_readings(source: &str, cwd: Option<&str>, cds: &[Range<usize>]) -> Vec<ParseResult> {
+fn other_readings(
+    source: &str,
+    cwd: Option<&str>,
+    cds: &[Range<usize>],
+    joined: Option<&str>,
+) -> Vec<ParseResult> {
     let mut readings = Vec::new();
-    if source.contains("\\\n") {
+    if let Some(joined) = joined {
         if !take_reading_walk() {
             readings.push(unresolved_reading(source, cwd));
             return readings;
         }
-        readings.push(parse_with_cwd(&source.replace("\\\n", ""), cwd));
+        readings.push(parse_reading(joined, cwd));
+    }
+    // tree-sitter pulls a line that starts with an escaped program name
+    // (`\export ...`) into the command before it; without the backslash it
+    // is read as the command the shell runs.
+    if let Some(unescaped) = unescape_line_starts(source) {
+        if !take_reading_walk() {
+            readings.push(unresolved_reading(source, cwd));
+            return readings;
+        }
+        readings.push(parse_reading(&unescaped, cwd));
     }
     if cds.len() > MAX_CD_READINGS {
         readings.push(unresolved_reading(source, cwd));
@@ -285,6 +313,138 @@ fn replace_ranges(source: &str, ranges: &[&Range<usize>], with: &str) -> String 
     text
 }
 
+/// Merge the words a glued child added at `from` into the word before.
+fn merge_glued(words: &mut Vec<String>, literal: &mut Vec<bool>, from: usize) {
+    if from == 0 || words.len() <= from {
+        return;
+    }
+    let tail: String = words.drain(from..).collect();
+    words[from - 1].push_str(&tail);
+    literal.truncate(from);
+    literal[from - 1] = false;
+}
+
+/// The source with the backslash removed from every line that starts, after
+/// blanks, with a backslash and then a character that is not a newline; `None`
+/// when there is no such line.
+fn unescape_line_starts(source: &str) -> Option<String> {
+    let mut out = String::with_capacity(source.len());
+    let mut changed = false;
+    for (index, line) in source.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+            let blanks = line.len() - line.trim_start_matches([' ', '\t']).len();
+            let rest = &line[blanks..];
+            if rest.starts_with('\\') && rest.len() > 1 {
+                out.push_str(&line[..blanks]);
+                out.push_str(&rest[1..]);
+                changed = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    changed.then_some(out)
+}
+
+/// A comment that does not start a word: the byte before `#` is not a blank
+/// or operator, or is a blank escaped by a backslash (`\ #`).
+fn misread_comment(root: Node<'_>, bytes: &[u8]) -> bool {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "comment" {
+            let start = node.start_byte();
+            if start > 0 {
+                let before = bytes[start - 1];
+                let starts_word = matches!(before, b'\n' | b';' | b'&' | b'|' | b'(' | b')')
+                    || matches!(before, b' ' | b'\t' | b'\r' | 0x0b | 0x0c) && {
+                        let backslashes = bytes[..start - 1]
+                            .iter()
+                            .rev()
+                            .take_while(|&&byte| byte == b'\\')
+                            .count();
+                        backslashes % 2 == 0
+                    };
+                if !starts_word {
+                    return true;
+                }
+            }
+        }
+        stack.extend(node.children(&mut cursor));
+    }
+    false
+}
+
+/// A command name the shell reads as `cd`: `cd`, `\cd`, `c\d`, `'cd'`.
+fn names_cd(name: Node<'_>, bytes: &[u8]) -> bool {
+    let text = name.utf8_text(bytes).unwrap_or("");
+    decode_token(text) == "cd"
+        || name
+            .named_child(0)
+            .and_then(|word| literal_word(word, bytes))
+            .is_some_and(|word| word == "cd")
+}
+
+/// The source with the backslash-newlines the shell removes taken out. The
+/// shell keeps them inside a comment (the newline ends it), a single-quoted
+/// or ANSI-C string and the body of a heredoc with a quoted delimiter; an
+/// escaped backslash before a newline is not a continuation.
+fn join_continuations(source: &str, root: Node<'_>) -> String {
+    let bytes = source.as_bytes();
+    let mut kept: Vec<Range<usize>> = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "comment" | "raw_string" | "ansi_c_string" => kept.push(node.byte_range()),
+            "heredoc_redirect" => {
+                let mut inner = node.walk();
+                let children: Vec<Node<'_>> = node.children(&mut inner).collect();
+                let quoted = children.iter().any(|child| {
+                    child.kind() == "heredoc_start"
+                        && child
+                            .utf8_text(bytes)
+                            .is_ok_and(|start| start.contains(['\'', '"', '\\']))
+                });
+                if quoted {
+                    kept.extend(
+                        children
+                            .iter()
+                            .filter(|child| child.kind() == "heredoc_body")
+                            .map(|body| body.byte_range()),
+                    );
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.children(&mut cursor));
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && !kept.iter().any(|range| range.contains(&i)) {
+            match bytes.get(i + 1) {
+                Some(b'\n') => {
+                    i += 2;
+                    continue;
+                }
+                Some(&escaped) => {
+                    out.push(b'\\');
+                    out.push(escaped);
+                    i += 2;
+                    continue;
+                }
+                None => {}
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Only ASCII pairs were removed, so the text stays UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.replace("\\\n", ""))
+}
+
 /// The byte ranges of every `cd` command in the tree.
 fn cd_commands(node: Node<'_>, bytes: &[u8]) -> Vec<Range<usize>> {
     let mut found = Vec::new();
@@ -294,7 +454,7 @@ fn cd_commands(node: Node<'_>, bytes: &[u8]) -> Vec<Range<usize>> {
         if node.kind() == "command"
             && node
                 .child_by_field_name("name")
-                .is_some_and(|name| name.utf8_text(bytes) == Ok("cd"))
+                .is_some_and(|name| names_cd(name, bytes))
         {
             found.push(node.byte_range());
         }
@@ -308,16 +468,35 @@ fn walk_source(
     source: &str,
     cwd: Option<&str>,
     cd_fails: bool,
-) -> (ParseResult, Vec<Range<usize>>) {
+) -> (ParseResult, Vec<Range<usize>>, Option<String>) {
+    let (mut result, cds, joined, misread) = walk_tree(source, cwd, cd_fails);
+    // A `#` the shell reads as text (`echo \ #; cmd`) but tree-sitter takes
+    // for a comment hides what follows it.
+    if misread {
+        result.raw_allow_eligible = false;
+        result.extra_readings += 1;
+        result
+            .commands
+            .extend(unresolved_reading(source, cwd).commands);
+    }
+    (result, cds, joined)
+}
+
+/// [`walk_source`] without the misread-comment marker.
+fn walk_tree(
+    source: &str,
+    cwd: Option<&str>,
+    cd_fails: bool,
+) -> (ParseResult, Vec<Range<usize>>, Option<String>, bool) {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .is_err()
     {
-        return (ParseResult::failed(), Vec::new());
+        return (ParseResult::failed(), Vec::new(), None, false);
     }
     let Some(tree) = parser.parse(source, None) else {
-        return (ParseResult::failed(), Vec::new());
+        return (ParseResult::failed(), Vec::new(), None, false);
     };
 
     let bytes = source.as_bytes();
@@ -335,13 +514,18 @@ fn walk_source(
         && walker.commands[0].wrappers.is_empty();
 
     let cds = cd_commands(root, bytes);
+    let joined = source
+        .contains("\\\n")
+        .then(|| join_continuations(source, root))
+        .filter(|joined| joined != source);
     let result = ParseResult {
         raw_allow_eligible,
         extra_readings: walker.extra_readings,
         commands: walker.commands,
         had_error: tree_has_error(&tree),
     };
-    (result, cds)
+    let misread = misread_comment(root, bytes);
+    (result, cds, joined, misread)
 }
 
 /// A raw allow vouches for exactly one unwrapped, literal shell invocation.
@@ -416,7 +600,9 @@ fn decoded_reading(node: Node<'_>, bytes: &[u8]) -> Reading {
     /// ANSI-C escape this does not model, `$"..."` or brace expansion.
     fn undecodable(node: Node<'_>, bytes: &[u8]) -> bool {
         let opaque = |part: Node<'_>| match part.kind() {
-            "ansi_c_string" => literal_word(part, bytes).is_none(),
+            "ansi_c_string" => {
+                literal_word(part, bytes).is_none() || !ansi_c_ends_at_node(part, bytes)
+            }
             // A glued `$"rd"` parses as an anonymous `$` and a string.
             "translated_string" | "brace_expression" | "$" => true,
             _ => false,
@@ -488,6 +674,27 @@ fn zsh_equals(child: Node<'_>, bytes: &[u8]) -> Option<String> {
     program.then(|| name.to_string())
 }
 
+/// Whether bash ends this `$'...'` where tree-sitter does: `\` escapes the
+/// next character, the first other `'` closes it. tree-sitter reads
+/// `$'\\';rm x;'` as one string, where bash closes it after `\\`.
+fn ansi_c_ends_at_node(node: Node<'_>, bytes: &[u8]) -> bool {
+    let text = node.utf8_text(bytes).unwrap_or("");
+    let Some(inner) = text.strip_prefix("$'") else {
+        return false;
+    };
+    let mut chars = inner.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' => return index + 1 == inner.len(),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The word a run of literal parts passes to the program, or `None` when any
 /// part expands at run time or is a shape this does not model.
 fn literal_word(node: Node<'_>, bytes: &[u8]) -> Option<String> {
@@ -510,7 +717,7 @@ fn literal_word(node: Node<'_>, bytes: &[u8]) -> Option<String> {
             .ok()
             .filter(|words| words.len() == 1)
             .and_then(|mut words| words.pop()),
-        "ansi_c_string" => text
+        "ansi_c_string" if ansi_c_ends_at_node(node, bytes) => text
             .strip_prefix("$'")
             .and_then(|t| t.strip_suffix('\''))
             .and_then(decode_ansi_c),
@@ -581,6 +788,76 @@ fn decode_ansi_c(inner: &str) -> Option<String> {
         out.push(char::from_u32(value)?);
     }
     Some(out)
+}
+
+/// Whether argv holds exactly what the shell passes for this command child.
+///
+/// A single-quoted string, a double-quoted string with nothing to expand and
+/// no backslash (argv does not decode its escapes), a number, and an unquoted
+/// word made only of characters no shell expands. A word starting with `=`
+/// is a zsh path expansion. Anything else, including a glued quote whose
+/// argv keeps the quote marks, is not literal.
+fn literal_value(node: Node<'_>, bytes: &[u8]) -> bool {
+    let text = node.utf8_text(bytes).unwrap_or("");
+    match node.kind() {
+        "raw_string" | "number" => true,
+        "word" => plain_word(text),
+        // zsh expands `$~X`, `$^X` and `$=X` inside double quotes, which
+        // tree-sitter keeps as string content; argv does not decode a
+        // backslash in double quotes.
+        "string" => literal_node(node, bytes) && !text.contains(['\\', '$', '`']),
+        // argv keeps the quote marks of a quoted program name (`'export'`).
+        "command_name" => node.named_child(0).is_some_and(|name| {
+            name.kind() == "word" && plain_word(name.utf8_text(bytes).unwrap_or(""))
+        }),
+        "concatenation" => {
+            let mut cursor = node.walk();
+            let words = node.children(&mut cursor).all(|part| part.kind() == "word");
+            words && plain_word(text)
+        }
+        _ => false,
+    }
+}
+
+/// An unquoted word no shell expands: characters outside every expansion,
+/// glob and zsh path syntax, or any character behind a backslash (argv
+/// decodes the escape). A leading unescaped `=` is a zsh path expansion.
+fn plain_word(text: &str) -> bool {
+    let mut chars = text.chars();
+    let mut any = false;
+    while let Some(c) = chars.next() {
+        any = true;
+        match c {
+            '\\' => {
+                if chars.next().is_none_or(|escaped| escaped == '\n') {
+                    return false;
+                }
+            }
+            c if c.is_alphanumeric() => {}
+            '_' | '.' | '/' | ':' | '@' | '%' | '+' | ',' | '-' => {}
+            '=' if any && !text.starts_with('=') => {}
+            _ => return false,
+        }
+    }
+    any
+}
+
+/// Whether a word that literal_word decoded is fixed at run time: every part
+/// is a single-quoted string, a double-quoted string literal_value accepts,
+/// a plain word or a decodable ANSI-C string.
+fn decoded_literal(node: Node<'_>, bytes: &[u8]) -> bool {
+    match node.kind() {
+        "concatenation" => {
+            let mut cursor = node.walk();
+            let parts: Vec<Node<'_>> = node.children(&mut cursor).collect();
+            parts.iter().all(|part| decoded_literal(*part, bytes))
+        }
+        "command_name" => node
+            .named_child(0)
+            .is_some_and(|name| decoded_literal(name, bytes)),
+        "ansi_c_string" => literal_word(node, bytes).is_some(),
+        _ => literal_value(node, bytes),
+    }
 }
 
 fn literal_node(node: Node<'_>, bytes: &[u8]) -> bool {
@@ -700,6 +977,7 @@ impl<'a> Walker<'a> {
         &mut self,
         argv: &[String],
         reading: &[String],
+        literal: &[bool],
         wrappers: &[Wrapper],
         remote: bool,
         chrooted: bool,
@@ -709,6 +987,7 @@ impl<'a> Walker<'a> {
         }
         let mut opaque = dispatches(argv, reading);
         let mut peeled = reading.to_vec();
+        let mut peeled_literal = literal.to_vec();
         let mut chain = wrappers.to_vec();
         let (mut peeled_remote, mut peeled_chrooted) = (remote, chrooted);
         while let Some((wrapper, inner, r, c, body)) = unwrap_wrapper(&peeled) {
@@ -721,6 +1000,9 @@ impl<'a> Walker<'a> {
             chain.push(wrapper);
             peeled_remote |= r;
             peeled_chrooted |= c;
+            // xargs -I, watch, ssh and sudo -s hand the words to something
+            // that substitutes or re-evaluates them.
+            peeled_literal.clear();
             peeled = inner;
         }
         if peeled != reading {
@@ -740,6 +1022,7 @@ impl<'a> Walker<'a> {
                 wrappers: chain,
                 remote: peeled_remote,
                 chrooted: peeled_chrooted,
+                literal: peeled_literal,
             });
         }
         self.extra_readings += 1;
@@ -750,8 +1033,24 @@ impl<'a> Walker<'a> {
             wrappers: wrappers.to_vec(),
             remote,
             chrooted,
+            literal: literal.to_vec(),
         });
         opaque
+    }
+
+    /// Take over a command from a nested walk (a `bash -c` body, a heredoc or
+    /// a pipe into a shell, an expanded command). The nested walk starts in
+    /// this directory, so a command it left without one ran after a cd it
+    /// could not resolve. Before, this directory was put back on it; that
+    /// reading stays as an extra one, so a verdict can only get stricter.
+    fn push_nested(&mut self, cmd: EffectiveCommand) {
+        if cmd.cwd.is_none() && self.cwd.is_some() {
+            let mut known = cmd.clone();
+            known.cwd = self.cwd.clone();
+            self.extra_readings += 1;
+            self.commands.push(known);
+        }
+        self.commands.push(cmd);
     }
 
     /// `left && right` whose left side cannot succeed in this reading.
@@ -959,17 +1258,14 @@ impl<'a> Walker<'a> {
                             continue;
                         }
                         let body = strip_outer_quotes(arg);
-                        let parsed = parse(body);
+                        let parsed = parse_with_cwd(body, self.cwd.as_deref());
                         self.extra_readings += parsed.extra_readings;
                         for mut cmd in parsed.commands {
                             let mut chain = wrappers.to_vec();
                             chain.push(Wrapper::Shell);
                             chain.extend(cmd.wrappers);
                             cmd.wrappers = chain;
-                            if cmd.cwd.is_none() {
-                                cmd.cwd = self.cwd.clone();
-                            }
-                            self.commands.push(cmd);
+                            self.push_nested(cmd);
                         }
                     }
                 }
@@ -988,6 +1284,7 @@ impl<'a> Walker<'a> {
                         wrappers: wrappers.to_vec(),
                         remote,
                         chrooted,
+                        literal: Vec::new(),
                     });
                 }
                 _ => {
@@ -1129,6 +1426,10 @@ impl<'a> Walker<'a> {
         chrooted: bool,
     ) {
         let mut argv = vec![kind.to_owned()];
+        // A target comes only from a redirect destination that passed
+        // literal_node and split into one shell word; zsh expands `=name`.
+        let mut literal = vec![false];
+        literal.extend(target.as_deref().map(|t| !t.starts_with('=')));
         argv.extend(target);
         self.commands.push(EffectiveCommand {
             argv,
@@ -1137,6 +1438,7 @@ impl<'a> Walker<'a> {
             wrappers: wrappers.to_vec(),
             remote,
             chrooted,
+            literal,
         });
     }
 
@@ -1171,12 +1473,30 @@ impl<'a> Walker<'a> {
         if duplication_or_output && (raw == "-" || raw.bytes().all(|b| b.is_ascii_digit())) {
             return;
         }
-        let target = literal_node(destination, self.src)
+        // A word glued to the destination (`> '/dir/'\name`) is part of the
+        // file name the shell opens, which tree-sitter puts elsewhere.
+        let mut inner = node.walk();
+        let glued = node
+            .children(&mut inner)
+            .any(|child| child.start_byte() == destination.end_byte())
+            || destination.end_byte() == node.end_byte()
+                && node
+                    .next_sibling()
+                    .is_some_and(|next| next.start_byte() == node.end_byte());
+        let target = (literal_node(destination, self.src) && !glued)
             .then(|| shell_words::split(raw).ok())
             .flatten()
             .filter(|words| words.len() == 1)
             .and_then(|mut words| words.pop());
+        let target_literal = decoded_literal(destination, self.src);
         self.push_shell_effect("__shell_output__", target, wrappers, remote, chrooted);
+        // The target is the text the shell writes to only when every part
+        // of it is literal (not `"$~X"` in zsh).
+        if let Some(command) = self.commands.last_mut() {
+            if command.argv.len() == 2 {
+                command.literal[1] = target_literal && command.literal[1];
+            }
+        }
     }
 
     /// command + redirect pair as `redirected_statement` with the
@@ -1274,6 +1594,7 @@ impl<'a> Walker<'a> {
                     wrappers: wrappers.to_vec(),
                     remote,
                     chrooted,
+                    literal: Vec::new(),
                 });
                 String::new()
             });
@@ -1293,10 +1614,7 @@ impl<'a> Walker<'a> {
                     cmd.wrappers = chain;
                     cmd.remote = cmd.remote || remote;
                     cmd.chrooted = cmd.chrooted || chrooted;
-                    if cmd.cwd.is_none() {
-                        cmd.cwd = self.cwd.clone();
-                    }
-                    self.commands.push(cmd);
+                    self.push_nested(cmd);
                 }
             }
             return;
@@ -1323,7 +1641,13 @@ impl<'a> Walker<'a> {
         for child in &children {
             match child.kind() {
                 "file_redirect" => self.handle_file_redirect(*child, wrappers, remote, chrooted),
-                "command_substitution" | "process_substitution" | "variable_assignment" => {
+                // `$(( $(rm -rf /) ))` and `${X:-$(rm -rf /)}` run the
+                // substitution inside them too.
+                "command_substitution"
+                | "process_substitution"
+                | "variable_assignment"
+                | "arithmetic_expansion"
+                | "expansion" => {
                     self.walk_named_children(*child, wrappers, remote, chrooted);
                 }
                 "string" | "raw_string" | "concatenation" => {
@@ -1347,16 +1671,34 @@ impl<'a> Walker<'a> {
         let mut reading: Vec<String> = Vec::new();
         // The same reading as zsh expands `=rm` in it.
         let mut equals: Vec<String> = Vec::new();
+        // One flag per word of argv, of the reading and of the zsh reading:
+        // see [`EffectiveCommand::literal`].
+        let mut literal: Vec<bool> = Vec::new();
+        let mut reading_literal: Vec<bool> = Vec::new();
+        let mut equals_literal: Vec<bool> = Vec::new();
         let mut opaque = false;
+        // Where the last argument part ends, which argv word it gave (if
+        // any), and whether it gave the readings one.
+        let mut previous_end: Option<usize> = None;
+        let mut previous_argv: Option<usize> = None;
+        let mut previous_in_reading = false;
+        // A part that reached neither argv nor the readings (`$(( ))`).
+        let mut dropped_part = false;
+        // Operands of a cd as the shell sees them, ANSI-C ones included.
+        let mut operands = 0usize;
+        let mut operands_end = false;
         for child in &children {
             let before = argv.len();
             let reading_before = reading.len();
+            let equals_before = equals.len();
             let child_reading = decoded_reading(*child, self.src);
             let same = matches!(child_reading, Reading::Same);
             match child_reading {
                 Reading::Same => {}
                 Reading::Decoded(word) => {
+                    let fixed = decoded_literal(*child, self.src);
                     reading.push(word);
+                    reading_literal.push(fixed);
                 }
                 Reading::Opaque => opaque = true,
             }
@@ -1403,20 +1745,81 @@ impl<'a> Walker<'a> {
                 }
                 _ => {}
             }
+            let child_literal = literal_value(*child, self.src);
+            literal.extend(std::iter::repeat_n(child_literal, argv.len() - before));
             // Parts that need no decoding read the same in both.
             if same {
                 reading.extend(argv[before..].iter().cloned());
+                reading_literal.extend_from_slice(&literal[before..]);
             }
             match zsh_equals(*child, self.src) {
-                Some(program) => equals.push(program),
-                None => equals.extend(reading[reading_before..].iter().cloned()),
+                // zsh puts the program's path there, not this word.
+                Some(program) => {
+                    equals.push(program);
+                    equals_literal.push(false);
+                }
+                None => {
+                    equals.extend(reading[reading_before..].iter().cloned());
+                    equals_literal.extend_from_slice(&reading_literal[reading_before..]);
+                }
+            }
+            // tree-sitter splits some single shell words in two, such as a
+            // quote glued to a word with a backslash (`'--'\output=x` or
+            // `$'--'\output=x` is `--output=x`). The readings get the one
+            // word the shell passes; argv's halves are then not literal. A
+            // part starting with a blank is not glued: tree-sitter only put
+            // it there (a newline before `\cmd` on the next line).
+            let part = !matches!(
+                child.kind(),
+                "command_name"
+                    | "file_redirect"
+                    | "herestring_redirect"
+                    | "heredoc_redirect"
+                    | "variable_assignment"
+                    | "comment"
+            );
+            let starts_blank = self.text(*child).starts_with(char::is_whitespace);
+            if part {
+                let gave_argv = argv.len() > before;
+                let gave_reading = reading.len() > reading_before;
+                if !gave_argv && !gave_reading {
+                    dropped_part = true;
+                }
+                if starts_blank {
+                    operands_end = true;
+                } else if !operands_end {
+                    operands += 1;
+                }
+                if previous_end == Some(child.start_byte()) && !starts_blank {
+                    literal[before..].fill(false);
+                    if let Some(index) = previous_argv {
+                        literal[index] = false;
+                    }
+                    if previous_in_reading && gave_reading {
+                        merge_glued(&mut reading, &mut reading_literal, reading_before);
+                        merge_glued(&mut equals, &mut equals_literal, equals_before);
+                    } else {
+                        opaque = true;
+                    }
+                }
+                previous_end = Some(child.end_byte());
+                previous_argv = gave_argv.then(|| argv.len() - 1);
+                previous_in_reading = reading.len() > reading_before;
             }
         }
-        opaque |= self.push_reading(&argv, &reading, wrappers, remote, chrooted);
+        opaque |= self.push_reading(
+            &argv,
+            &reading,
+            &reading_literal,
+            wrappers,
+            remote,
+            chrooted,
+        );
         // A separate reading, so that `=echo 'policy dir'/x` keeps what the
         // decoded reading alone gives it (an unknown program writing there).
         if equals != reading {
-            opaque |= self.push_reading(&argv, &equals, wrappers, remote, chrooted);
+            opaque |=
+                self.push_reading(&argv, &equals, &equals_literal, wrappers, remote, chrooted);
         }
         if opaque {
             // An extra command like the decoded reading: it must not count
@@ -1430,6 +1833,7 @@ impl<'a> Walker<'a> {
                 wrappers: wrappers.to_vec(),
                 remote,
                 chrooted,
+                literal: Vec::new(),
             });
         }
 
@@ -1498,6 +1902,7 @@ impl<'a> Walker<'a> {
             if let Some(body) = script_input {
                 argv.push("-c".to_string());
                 argv.push(body);
+                literal.extend([false, false]);
             }
         }
 
@@ -1563,15 +1968,16 @@ impl<'a> Walker<'a> {
                     let inner = parsed.commands;
                     if !inner.is_empty() {
                         for mut cmd in inner {
+                            // The shell splits and globs an unquoted
+                            // expansion; this re-parse of its text does not,
+                            // so no word of it is known to be literal.
+                            cmd.literal.clear();
                             let mut chain = wrappers.to_vec();
                             chain.extend(cmd.wrappers);
                             cmd.wrappers = chain;
                             cmd.remote = cmd.remote || remote;
                             cmd.chrooted = cmd.chrooted || chrooted;
-                            if cmd.cwd.is_none() {
-                                cmd.cwd = self.cwd.clone();
-                            }
-                            self.commands.push(cmd);
+                            self.push_nested(cmd);
                         }
                         if found {
                             return;
@@ -1594,6 +2000,7 @@ impl<'a> Walker<'a> {
                 wrappers: wrappers.to_vec(),
                 remote,
                 chrooted,
+                literal: Vec::new(),
             });
             return;
         }
@@ -1606,7 +2013,16 @@ impl<'a> Walker<'a> {
         // checks against /tmp/var rather than /var).
         if argv[0] == "cd" {
             match argv.get(1).map(String::as_str) {
-                Some(target) if target.starts_with('/') && !target.contains("..") => {
+                // A target that expands (`/tmp/$X`, `/tmp/"$~X"`) is not the
+                // text argv holds.
+                // zsh's `cd OLD NEW` substitutes in $PWD: one target only.
+                Some(target)
+                    if operands == 1
+                        && !dropped_part
+                        && target.starts_with('/')
+                        && !target.contains("..")
+                        && literal.get(1) == Some(&true) =>
+                {
                     self.cwd = Some(target.to_string());
                 }
                 _ => {
@@ -1622,6 +2038,7 @@ impl<'a> Walker<'a> {
         // → re-parse body. `sudo nice -n 5 rm -rf /etc` peels sudo →
         // nice → rm.
         let mut current_argv = argv;
+        let mut current_literal = literal;
         let mut chain: Vec<Wrapper> = wrappers.to_vec();
         let mut acc_remote = remote;
         let mut acc_chrooted = chrooted;
@@ -1655,6 +2072,7 @@ impl<'a> Walker<'a> {
                             wrappers: std::mem::take(&mut full_chain),
                             remote: acc_remote,
                             chrooted: acc_chrooted,
+                            literal: Vec::new(),
                         });
                         return;
                     }
@@ -1679,10 +2097,7 @@ impl<'a> Walker<'a> {
                         cmd.wrappers = full_chain;
                         cmd.remote = cmd.remote || acc_remote;
                         cmd.chrooted = cmd.chrooted || acc_chrooted;
-                        if cmd.cwd.is_none() {
-                            cmd.cwd = self.cwd.clone();
-                        }
-                        self.commands.push(cmd);
+                        self.push_nested(cmd);
                     }
                     if found {
                         return;
@@ -1698,6 +2113,8 @@ impl<'a> Walker<'a> {
                 // peeling; record the wrapper itself.
                 return;
             }
+            // See push_reading: a wrapper may re-evaluate the words.
+            current_literal.clear();
             current_argv = inner;
         }
 
@@ -1722,6 +2139,7 @@ impl<'a> Walker<'a> {
             wrappers: chain,
             remote: acc_remote,
             chrooted: acc_chrooted,
+            literal: current_literal,
         });
     }
 }
@@ -2395,6 +2813,50 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert!(c[0].chrooted);
         assert_eq!(c[0].argv, vec!["rm", "-rf", "/etc"]);
+    }
+
+    /// A word is literal only when argv holds what the shell passes.
+    #[test]
+    fn literal_flags_follow_the_shell() {
+        let flags = |src: &str| {
+            let c = cmds(src);
+            (c[0].argv.clone(), c[0].literal.clone())
+        };
+        assert_eq!(flags("sed -i 's/a*/b/' f.txt").1, vec![true; 4]);
+        assert_eq!(flags("cp a *.txt").1, vec![true, true, false]);
+        assert_eq!(flags("cp a \"$X\"").1, vec![true, true, false]);
+        assert_eq!(flags("cp a \"b c\"").1, vec![true, true, true]);
+        // An escaped glob character is literal; `=x` and `~/y` expand.
+        assert_eq!(
+            flags("cp a =x ~/y b\\*").1,
+            vec![true, true, false, false, true]
+        );
+        // A backslash inside double quotes is not decoded by argv; zsh
+        // expands `$~X` inside double quotes.
+        assert_eq!(flags("cp a \"b\\\"c\"").1, vec![true, true, false]);
+        assert_eq!(flags("touch \"$~X\"").1, vec![true, false]);
+        // argv keeps the glued quote marks; the decoded reading holds the word.
+        let glued = cmds("cp a 'policy dir'/x");
+        let literal_of = |word: &str| {
+            glued
+                .iter()
+                .find(|cmd| cmd.argv.last().map(String::as_str) == Some(word))
+                .map(|cmd| cmd.literal.clone())
+        };
+        assert_eq!(literal_of("'policy dir'/x"), Some(vec![true, true, false]));
+        assert_eq!(literal_of("policy dir/x"), Some(vec![true, true, true]));
+        // A wrapper may substitute or re-evaluate words (xargs -I, watch,
+        // ssh, sudo -s), so a peeled command keeps no flags.
+        let (argv, literal) = flags("sudo -u root cp a 'b*'");
+        assert_eq!(argv, vec!["cp", "a", "b*"]);
+        assert!(literal.is_empty());
+        // A quoted program name keeps its quote marks in argv.
+        let quoted = cmds("'export' A=1");
+        let argv_form = quoted.iter().find(|cmd| cmd.argv[0] == "'export'").unwrap();
+        assert_eq!(argv_form.literal, vec![false, true]);
+        // The re-parse of an expanded program name does not split or glob.
+        let c = cmds("X='cp a b'; $X");
+        assert!(c.iter().all(|cmd| cmd.literal.is_empty()), "{c:?}");
     }
 
     #[test]

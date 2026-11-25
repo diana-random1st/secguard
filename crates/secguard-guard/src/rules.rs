@@ -45,13 +45,16 @@ fn read_only(command: &EffectiveCommand) -> bool {
     match command.head().map(basename) {
         Some("cat" | "echo" | "file" | "head" | "ls" | "printf" | "stat" | "tail" | "wc") => true,
         // Only simple read subcommands, never arbitrary git options or aliases.
+        // Every word must be literal: `git log "$OUT"` with
+        // OUT='--output=FILE' writes FILE.
         Some("git") => {
             matches!(
                 command.args().first().map(String::as_str),
                 Some("status" | "log" | "show" | "ls-files" | "rev-parse")
-            ) && command.args()[1..]
-                .iter()
-                .all(|arg| !arg.starts_with('-') || arg == "--")
+            ) && (1..command.argv.len()).all(|index| command.is_literal(index))
+                && command.args()[1..]
+                    .iter()
+                    .all(|arg| !arg.starts_with('-') || arg == "--")
         }
         _ => false,
     }
