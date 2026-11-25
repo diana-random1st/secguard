@@ -101,6 +101,10 @@ pub struct ParseResult {
     pub commands: Vec<EffectiveCommand>,
     pub had_error: bool,
     pub(crate) raw_allow_eligible: bool,
+    /// How many of `commands` are extra decoded readings rather than what
+    /// the walk itself produced. A caller deciding whether a re-parse
+    /// "found nothing" must not count them.
+    pub(crate) extra_readings: usize,
 }
 
 /// Parse a raw bash command. Always returns a list of commands (possibly
@@ -119,6 +123,7 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
             commands: Vec::new(),
             had_error: true,
             raw_allow_eligible: false,
+            extra_readings: 0,
         };
     }
     let Some(tree) = parser.parse(source, None) else {
@@ -126,6 +131,7 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
             commands: Vec::new(),
             had_error: true,
             raw_allow_eligible: false,
+            extra_readings: 0,
         };
     };
 
@@ -144,6 +150,7 @@ pub(crate) fn parse_with_cwd(source: &str, cwd: Option<&str>) -> ParseResult {
 
     ParseResult {
         raw_allow_eligible,
+        extra_readings: walker.extra_readings,
         commands: walker.commands,
         had_error: tree_has_error(&tree),
     }
@@ -162,6 +169,213 @@ fn simple_literal_command(node: Node<'_>, bytes: &[u8]) -> bool {
             _ => literal_node(child, bytes),
         });
     simple
+}
+
+/// The decoded reading is classified as a flat command: it is not
+/// unwrapped, re-parsed as a shell body or tracked as a cd. It cannot stand
+/// for the command when what it decodes is a wrapper the walker would
+/// unwrap (`'sudo' rm`, `"bash" -c`, `'eval'`, `'find' -delete`), a
+/// directory change (`"cd"`, or `cd /x/'policy dir'` whose target needed
+/// decoding) or a script the shell sources.
+fn dispatches(argv: &[String], reading: &[String]) -> bool {
+    let decoded_head = argv.first() != reading.first();
+    let head = reading.first().map_or("", |head| basename(head));
+    let directory_or_source = matches!(head, "cd" | "pushd" | "popd" | "source" | ".");
+    // A quoted shell may read its script from stdin (`'bash' <<< ...`,
+    // `| 'bash'`), which unwrap_wrapper only models for `-c`.
+    let shell = matches!(head, "bash" | "sh" | "zsh" | "ksh" | "dash" | "fish");
+    directory_or_source || decoded_head && (shell || unwrap_wrapper(reading).is_some())
+}
+
+/// A glob, or a brace that is not a `${...}` parameter expansion (which
+/// argv's own indirect path handles).
+fn expands_to_a_program(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    name.contains(['*', '?', '['])
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'{' && (i == 0 || bytes[i - 1] != b'$'))
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// How one command child reads once its quoted parts are decoded.
+enum Reading {
+    /// argv already holds what the program receives.
+    Same,
+    /// The program receives this word instead.
+    Decoded(String),
+    /// The program receives something this parser cannot decode.
+    Opaque,
+}
+
+/// Only the shapes argv gets wrong: a program name that holds quotes, a
+/// word glued from quoted parts (argv keeps the quote marks), an ANSI-C
+/// string (dropped when standalone, kept raw when glued), and nodes argv
+/// drops outright. Only direct children are inspected: a command
+/// substitution inside a word is walked as its own command.
+fn decoded_reading(node: Node<'_>, bytes: &[u8]) -> Reading {
+    fn quoted_part(part: Node<'_>) -> bool {
+        matches!(
+            part.kind(),
+            "string" | "raw_string" | "ansi_c_string" | "translated_string"
+        )
+    }
+    /// A part whose text the program receives cannot be decoded here: an
+    /// ANSI-C escape this does not model, `$"..."` or brace expansion.
+    fn undecodable(node: Node<'_>, bytes: &[u8]) -> bool {
+        let opaque = |part: Node<'_>| match part.kind() {
+            "ansi_c_string" => literal_word(part, bytes).is_none(),
+            // A glued `$"rd"` parses as an anonymous `$` and a string.
+            "translated_string" | "brace_expression" | "$" => true,
+            _ => false,
+        };
+        let mut cursor = node.walk();
+        opaque(node) || node.children(&mut cursor).any(opaque)
+    }
+    /// Decoded when every part is literal. A part that expands at run time
+    /// (`"$HOME/bin/x"`, `$'a'"$USER"`) leaves argv as it was, `$` visible
+    /// to its indirect path; only an undecodable part is opaque.
+    fn decode(node: Node<'_>, bytes: &[u8]) -> Reading {
+        match literal_word(node, bytes) {
+            Some(word) => Reading::Decoded(word),
+            None if undecodable(node, bytes) => Reading::Opaque,
+            None => Reading::Same,
+        }
+    }
+    let glued_quotes = |node: Node<'_>| {
+        let mut cursor = node.walk();
+        let quoted = node.children(&mut cursor).any(quoted_part);
+        quoted
+    };
+    match node.kind() {
+        // `r{m,}`, `/bin/r?`: brace or glob expansion picks the program at
+        // run time; tree-sitter often keeps such a name as a plain word.
+        "command_name" if node.utf8_text(bytes).is_ok_and(expands_to_a_program) => Reading::Opaque,
+        "command_name" => match node.named_child(0) {
+            Some(name) if matches!(name.kind(), "string" | "raw_string") => decode(name, bytes),
+            // `$"rm"`, `r{m,}`: the program run is not decoded here.
+            Some(name) if matches!(name.kind(), "translated_string" | "brace_expression") => {
+                Reading::Opaque
+            }
+            Some(name) if name.kind() == "concatenation" && glued_quotes(name) => {
+                decode(name, bytes)
+            }
+            // argv decodes a whole `$'rm'` only when it has no escapes.
+            Some(name) if name.kind() == "ansi_c_string" => match literal_word(name, bytes) {
+                Some(word) if name.utf8_text(bytes).is_ok_and(|t| decode_token(t) == word) => {
+                    Reading::Same
+                }
+                Some(word) => Reading::Decoded(word),
+                None => Reading::Opaque,
+            },
+            _ => Reading::Same,
+        },
+        "ansi_c_string" => decode(node, bytes),
+        // `--output='policy dir/x'`, `'policy dir'/x`: argv keeps the quote
+        // marks, so the decoded word is read once more.
+        "concatenation" if glued_quotes(node) => decode(node, bytes),
+        "translated_string" | "brace_expression" => Reading::Opaque,
+        _ => Reading::Same,
+    }
+}
+
+/// The word a run of literal parts passes to the program, or `None` when any
+/// part expands at run time or is a shape this does not model.
+fn literal_word(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let text = node.utf8_text(bytes).ok()?;
+    match node.kind() {
+        "concatenation" => {
+            let mut cursor = node.walk();
+            let mut word = String::new();
+            for child in node.children(&mut cursor) {
+                word.push_str(&literal_word(child, bytes)?);
+            }
+            Some(word)
+        }
+        "word" | "number" if literal_node(node, bytes) => Some(decode_token(text)),
+        "raw_string" => text
+            .strip_prefix('\'')
+            .and_then(|t| t.strip_suffix('\''))
+            .map(str::to_string),
+        "string" if literal_node(node, bytes) => shell_words::split(text)
+            .ok()
+            .filter(|words| words.len() == 1)
+            .and_then(|mut words| words.pop()),
+        "ansi_c_string" => text
+            .strip_prefix("$'")
+            .and_then(|t| t.strip_suffix('\''))
+            .and_then(decode_ansi_c),
+        _ => None,
+    }
+}
+
+/// The text bash makes of the inside of `$'...'`, or `None` for an escape
+/// this does not model or a byte outside ASCII (bash emits raw bytes there).
+/// A NUL makes the word opaque: bash and zsh read it differently.
+fn decode_ansi_c(inner: &str) -> Option<String> {
+    /// Up to `max` digits of `radix` from the front of `chars`, as text.
+    fn digits(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max: usize,
+    ) -> String {
+        let mut taken = String::new();
+        while taken.len() < max {
+            match chars.peek() {
+                Some(c) if c.is_digit(radix) => taken.push(*c),
+                _ => break,
+            }
+            chars.next();
+        }
+        taken
+    }
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let value = match chars.next()? {
+            'a' => 0x07,
+            'b' => 0x08,
+            'e' | 'E' => 0x1b,
+            'f' => 0x0c,
+            'n' => 0x0a,
+            'r' => 0x0d,
+            't' => 0x09,
+            'v' => 0x0b,
+            '\\' => 0x5c,
+            '\'' => 0x27,
+            '"' => 0x22,
+            '?' => 0x3f,
+            first @ '0'..='7' => {
+                let mut octal = String::from(first);
+                octal.push_str(&digits(&mut chars, 8, 2));
+                u32::from_str_radix(&octal, 8).ok()?
+            }
+            'x' => u32::from_str_radix(&digits(&mut chars, 16, 2), 16).ok()?,
+            // bash reads `\cX` as a control byte, zsh as the text `cX`
+            // (`$'\chmod'` runs chmod under zsh): no single reading.
+            'c' => return None,
+            _ => return None,
+        };
+        if value == 0 {
+            // bash keeps the text after a NUL out of the word, zsh cuts the
+            // word there (`$'rm\x00'x` runs `rm` under zsh): no single
+            // reading is right, so the part is opaque.
+            return None;
+        }
+        if value > 0x7f {
+            return None;
+        }
+        out.push(char::from_u32(value)?);
+    }
+    Some(out)
 }
 
 fn literal_node(node: Node<'_>, bytes: &[u8]) -> bool {
@@ -208,6 +422,9 @@ struct Walker<'a> {
     /// Subshell save/restore mirrors `cwd` because `(a=...)` does not
     /// leak the binding outside.
     bindings: HashMap<String, String>,
+    /// Extra decoded readings pushed into `commands`, including those taken
+    /// over from nested re-parses (see [`ParseResult::extra_readings`]).
+    extra_readings: usize,
 }
 
 /// Names we trust to resolve from process env at parse time.
@@ -230,6 +447,7 @@ impl<'a> Walker<'a> {
             commands: Vec::new(),
             cwd: None,
             bindings: HashMap::new(),
+            extra_readings: 0,
         }
     }
 
@@ -430,7 +648,9 @@ impl<'a> Walker<'a> {
                             continue;
                         }
                         let body = strip_outer_quotes(arg);
-                        for mut cmd in parse(body).commands {
+                        let parsed = parse(body);
+                        self.extra_readings += parsed.extra_readings;
+                        for mut cmd in parsed.commands {
                             let mut chain = wrappers.to_vec();
                             chain.push(Wrapper::Shell);
                             chain.extend(cmd.wrappers);
@@ -751,6 +971,9 @@ impl<'a> Walker<'a> {
                 if parsed.had_error {
                     self.push_shell_effect("__shell_unmodeled__", None, wrappers, remote, chrooted);
                 }
+                // Carry the nested count up, so an enclosing re-parse does
+                // not take these extra readings for commands it found.
+                self.extra_readings += parsed.extra_readings;
                 let inner = parsed.commands;
                 for mut cmd in inner {
                     let mut chain = wrappers.to_vec();
@@ -802,7 +1025,27 @@ impl<'a> Walker<'a> {
             }
         }
         // Second pass: collect argv tokens for the outer command.
+        //
+        // `reading` is the same argv with quoted parts decoded: the program
+        // a quoted name runs (`'r'm` → `rm`) and the ANSI-C arguments that
+        // argv drops (`rm $'-rf' $'/'`). argv itself is built exactly as
+        // before; when the two differ, the decoded reading is classified as
+        // an extra command, so a verdict can only get stricter. A part that
+        // cannot be decoded sets `opaque`, which adds an indirect marker: a
+        // non-approvable, indeterminate block.
+        let mut reading: Vec<String> = Vec::new();
+        let mut opaque = false;
         for child in &children {
+            let before = argv.len();
+            let child_reading = decoded_reading(*child, self.src);
+            let same = matches!(child_reading, Reading::Same);
+            match child_reading {
+                Reading::Same => {}
+                Reading::Decoded(word) => {
+                    reading.push(word);
+                }
+                Reading::Opaque => opaque = true,
+            }
             match child.kind() {
                 "command_name" | "word" | "concatenation" | "number" => {
                     // decode_token handles ANSI-C `$'X'` and unquoted
@@ -846,6 +1089,42 @@ impl<'a> Walker<'a> {
                 }
                 _ => {}
             }
+            // Parts that need no decoding read the same in both.
+            if same {
+                reading.extend(argv[before..].iter().cloned());
+            }
+        }
+        // The decoded reading is classified as a flat command: it is not
+        // unwrapped, re-parsed as a shell body or tracked as a cd. When the
+        // decoded program is one of those (`'sudo' rm`, `"bash" -c`,
+        // `'eval'`, `"cd"`), what it runs stays unknown.
+        if reading != argv && !reading.is_empty() && dispatches(&argv, &reading) {
+            opaque = true;
+        }
+        if reading != argv && !reading.is_empty() {
+            self.extra_readings += 1;
+            self.commands.push(EffectiveCommand {
+                argv: reading,
+                cwd: self.cwd.clone(),
+                span: SpanKind::Executed,
+                wrappers: wrappers.to_vec(),
+                remote,
+                chrooted,
+            });
+        }
+        if opaque {
+            // An extra command like the decoded reading: it must not count
+            // as something a re-parse found, or a wrapper's own fallback
+            // (lockdown egress, a protected operand) is dropped.
+            self.extra_readings += 1;
+            self.commands.push(EffectiveCommand {
+                argv: vec!["__indirect_unresolved__".to_string(), argv.join(" ")],
+                cwd: self.cwd.clone(),
+                span: SpanKind::Executed,
+                wrappers: wrappers.to_vec(),
+                remote,
+                chrooted,
+            });
         }
 
         // Shell stdin/script-input detection: `bash <<< BODY`,
@@ -970,6 +1249,11 @@ impl<'a> Walker<'a> {
                             chrooted,
                         );
                     }
+                    // Extra decoded readings are classified but are not a
+                    // command the walk found: with nothing else, the marker
+                    // below must still be emitted.
+                    let found = parsed.commands.len() > parsed.extra_readings;
+                    self.extra_readings += parsed.extra_readings;
                     let inner = parsed.commands;
                     if !inner.is_empty() {
                         for mut cmd in inner {
@@ -983,7 +1267,9 @@ impl<'a> Walker<'a> {
                             }
                             self.commands.push(cmd);
                         }
-                        return;
+                        if found {
+                            return;
+                        }
                     }
                     // Expansion produced no parseable command (empty
                     // value, whitespace only) — fall through to the
@@ -1077,6 +1363,8 @@ impl<'a> Walker<'a> {
                         acc_chrooted,
                     );
                 }
+                let found = parsed.commands.len() > parsed.extra_readings;
+                self.extra_readings += parsed.extra_readings;
                 let inner_cmds = parsed.commands;
                 if !inner_cmds.is_empty() {
                     for mut cmd in inner_cmds {
@@ -1090,7 +1378,9 @@ impl<'a> Walker<'a> {
                         }
                         self.commands.push(cmd);
                     }
-                    return;
+                    if found {
+                        return;
+                    }
                 }
                 // Re-parse failed completely — fall through to push the
                 // wrapper command itself with the body as opaque arg.
@@ -1708,6 +1998,21 @@ fn is_var_assign(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every nested re-parse carries its extra readings up, including the
+    /// `echo ... | bash` path, so no enclosing fallback counts them.
+    #[test]
+    fn nested_reparses_report_their_extra_readings() {
+        for src in [
+            "echo \"'r'm -rf /tmp/x\" | bash",
+            "bash <<< \"'r'm -rf /tmp/x\"",
+            "bash -c \"'r'm -rf /tmp/x\"",
+        ] {
+            let parsed = parse(src);
+            assert!(parsed.extra_readings >= 1, "{src}");
+            assert!(parsed.commands.len() > parsed.extra_readings, "{src}");
+        }
+    }
 
     fn cmds(src: &str) -> Vec<EffectiveCommand> {
         parse(src).commands
