@@ -106,10 +106,7 @@ reason = "local generated artifacts"
 "#,
     );
 
-    assert_eq!(
-        check_with_config("git clean -fd", &cfg),
-        Verdict::Safe
-    );
+    assert_eq!(check_with_config("git clean -fd", &cfg), Verdict::Safe);
 }
 
 #[test]
